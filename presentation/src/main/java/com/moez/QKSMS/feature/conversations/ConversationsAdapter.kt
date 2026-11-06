@@ -126,8 +126,13 @@ class ConversationsAdapter @Inject constructor(
             else -> conversation.snippet
         }
 
-        // Make the preview in italics if draft
-        if (conversation.draft.isNotEmpty()) binding.snippet.setTypeface(null, Typeface.ITALIC)
+        // RecyclerView reuses holders; explicitly restore style after a draft row is rebound.
+        val snippetStyle = when {
+            conversation.draft.isNotEmpty() -> Typeface.ITALIC
+            conversation.unread -> Typeface.BOLD
+            else -> Typeface.NORMAL
+        }
+        binding.snippet.setTypeface(binding.snippet.typeface, snippetStyle)
 
         binding.scheduled.isVisible = conversation.id in hasScheduledConversation
 

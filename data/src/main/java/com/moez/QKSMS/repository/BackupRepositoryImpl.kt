@@ -45,7 +45,6 @@ import dev.octoshrimpy.quik.model.Conversation
 import dev.octoshrimpy.quik.model.Message
 import dev.octoshrimpy.quik.model.MmsPart
 import dev.octoshrimpy.quik.util.Preferences
-import dev.octoshrimpy.quik.util.tryOrNull
 import io.reactivex.Observable
 import io.reactivex.subjects.BehaviorSubject
 import io.reactivex.subjects.Subject
@@ -120,6 +119,62 @@ class BackupRepositoryImpl @Inject constructor(
             BehaviorSubject.createDefault(BackupRepository.Progress.Idle())
 
     @Volatile private var stopFlag: Boolean = false
+    private val operationLock = Any()
+    private var operationInProgress: Boolean = false
+
+    private fun tryStartOperation(): Boolean = synchronized(operationLock) {
+        if (operationInProgress) {
+            false
+        } else {
+            operationInProgress = true
+            stopFlag = false
+            true
+        }
+    }
+
+    private fun finishOperation(progress: Subject<BackupRepository.Progress>) {
+        progress.onNext(BackupRepository.Progress.Finished())
+        val timer = Timer("FoxholeBackupProgress", true)
+        try {
+            timer.schedule(1000) {
+                try {
+                    synchronized(operationLock) {
+                        try {
+                            progress.onNext(BackupRepository.Progress.Idle())
+                        } finally {
+                            operationInProgress = false
+                        }
+                    }
+                } finally {
+                    timer.cancel()
+                }
+            }
+        } catch (error: Exception) {
+            timer.cancel()
+            failOperation(progress, error)
+        }
+    }
+
+    private fun failOperation(progress: Subject<BackupRepository.Progress>, error: Exception) {
+        Timber.e(error, "Backup or restore operation failed")
+        synchronized(operationLock) {
+            try {
+                progress.onNext(BackupRepository.Progress.Idle())
+            } finally {
+                operationInProgress = false
+            }
+        }
+    }
+
+    private fun cancelOperation(progress: Subject<BackupRepository.Progress>) {
+        synchronized(operationLock) {
+            try {
+                progress.onNext(BackupRepository.Progress.Idle())
+            } finally {
+                operationInProgress = false
+            }
+        }
+    }
 
     override fun getDefaultBackupPath(): String {
         return "${Environment.getExternalStorageDirectory()}/FoxholeMessages/Backups"
@@ -146,57 +201,49 @@ class BackupRepositoryImpl @Inject constructor(
     }
 
     override fun performBackup() {
-        // If a backup or restore is already running, don't do anything
-        if (isBackupOrRestoreRunning()) return
+        if (!tryStartOperation()) return
 
-        var messageCount: Int
+        try {
+            // Map all the messages into the JSON backup format while holding a single Realm.
+            val backupMessages = Realm.getDefaultInstance().use { realm ->
+                val messages = realm.where(Message::class.java)
+                    .sort("date")
+                    .findAll()
+                    .createSnapshot()
+                val messageCount = messages.size
 
-        // Map all the messages into our object we'll use for the Json mapping
-        val backupMessages = Realm.getDefaultInstance().use { realm ->
-            // Get the messages from realm
-            val messages = realm.where(Message::class.java).sort("date").findAll().createSnapshot()
-            messageCount = messages.size
-
-            // MMS doesn't track its own recipient list per-message (Message.address is just the
-            // sender), so fall back to the parent conversation's current recipients - same as how
-            // the rest of the app already treats "the conversation" as the group of people.
-            val conversationRecipients = realm.where(Conversation::class.java).findAll()
+                // MMS doesn't track its own recipient list per-message (Message.address is just
+                // the sender), so use the current recipients from the parent conversation.
+                val conversationRecipients = realm.where(Conversation::class.java).findAll()
                     .associate { conversation ->
                         conversation.id to conversation.recipients.map { recipient -> recipient.address }
                     }
 
-            // Map the messages to the new format
-            messages.mapIndexed { index, message ->
-                // Update the progress
-                backupProgress.onNext(BackupRepository.Progress.Running(messageCount, index))
-                messageToBackupMessage(message, conversationRecipients[message.threadId] ?: listOf())
+                messages.mapIndexed { index, message ->
+                    backupProgress.onNext(BackupRepository.Progress.Running(messageCount, index))
+                    messageToBackupMessage(message, conversationRecipients[message.threadId] ?: listOf())
+                }
             }
-        }
 
-        // Update the status, and set the progress to be indeterminate since we can no longer calculate progress
-        backupProgress.onNext(BackupRepository.Progress.Saving())
+            backupProgress.onNext(BackupRepository.Progress.Saving())
+            val adapter = moshi.adapter(Backup::class.java).indent("\t")
+            val json = adapter.toJson(Backup(backupMessages.size, backupMessages)).toByteArray()
 
-        // Convert the data to json
-        val adapter = moshi.adapter(Backup::class.java).indent("\t")
-        val json = adapter.toJson(Backup(messageCount, backupMessages)).toByteArray()
-
-        try {
             val timestamp = SimpleDateFormat("yyyyMMddHHmmss", Locale.getDefault()).format(now())
-            val inputStream = getBackupDocumentTree()
-                    ?.createFile("application/json", "backup-$timestamp.json")
-                    ?.let { file -> context.contentResolver.openOutputStream(file.uri) }
-                    ?: throw Exception("Failed to open output stream")
+            val outputStream = getBackupDocumentTree()
+                ?.createFile("application/json", "backup-$timestamp.json")
+                ?.let { file -> context.contentResolver.openOutputStream(file.uri) }
+                ?: throw IllegalStateException("Failed to open backup output stream")
 
-            inputStream.use { stream ->
+            outputStream.use { stream ->
                 stream.write(json)
+                stream.flush()
             }
-        } catch (e: Exception) {
-            Timber.w(e)
-        }
 
-        // Mark the task finished, and set it as Idle a second later
-        backupProgress.onNext(BackupRepository.Progress.Finished())
-        Timer().schedule(1000) { backupProgress.onNext(BackupRepository.Progress.Idle()) }
+            finishOperation(backupProgress)
+        } catch (error: Exception) {
+            failOperation(backupProgress, error)
+        }
     }
 
     private fun messageToBackupMessage(message: Message, recipients: List<String>): BackupMessage = BackupMessage(
@@ -223,16 +270,13 @@ class BackupRepositoryImpl @Inject constructor(
     )
 
     private fun mmsPartToBackupPart(part: MmsPart): BackupPart {
-        val isBinary = part.type.startsWith("image")
-                || part.type.startsWith("video")
-                || part.type.startsWith("audio")
-
-        val data = if (isBinary) {
-            tryOrNull {
-                context.contentResolver.openInputStream(part.getUri())?.use { stream ->
-                    Base64.encodeToString(stream.readBytes(), Base64.NO_WRAP)
-                }
-            }
+        // A null TEXT column means the provider stores this part's payload in its
+        // content URI. This includes non-media attachments such as PDFs, vCards,
+        // and application/octet-stream files, not just image/audio/video.
+        val data = if (part.text == null) {
+            val stream = context.contentResolver.openInputStream(part.getUri())
+                ?: throw IllegalStateException("Unable to read MMS part ${part.id} (${part.type})")
+            Base64.encodeToString(stream.use { it.readBytes() }, Base64.NO_WRAP)
         } else null
 
         return BackupPart(
@@ -262,36 +306,36 @@ class BackupRepositoryImpl @Inject constructor(
     }
 
     override fun performRestore(uri: Uri) {
-        // If a backupFile or restore is already running, don't do anything
-        if (isBackupOrRestoreRunning()) return
+        if (!tryStartOperation()) return
 
         restoreProgress.onNext(BackupRepository.Progress.Parsing())
 
-        val adapter = moshi.adapter(Backup::class.java)
-        val backup = DocumentFile.fromSingleUri(context, uri)
+        try {
+            val adapter = moshi.adapter(Backup::class.java)
+            val backup = DocumentFile.fromSingleUri(context, uri)
                 ?.let { file -> context.contentResolver.openInputStream(file.uri) }
                 ?.source()
                 ?.buffer()
                 ?.use(adapter::fromJson)
+                ?: throw IllegalArgumentException("Couldn't parse backup file")
 
-        val messageCount = backup?.messages?.size ?: 0
-        var errorCount = 0
+            val messageCount = backup.messages.size
+            var errorCount = 0
+            var cancelled = false
 
-        backup?.messages?.forEachIndexed { index, message ->
-            if (stopFlag) {
-                stopFlag = false
-                restoreProgress.onNext(BackupRepository.Progress.Idle())
-                return
-            }
+            backup.messages.forEachIndexed { index, message ->
+                if (stopFlag) {
+                    cancelled = true
+                    return@forEachIndexed
+                }
 
-            // Update the progress
-            restoreProgress.onNext(BackupRepository.Progress.Running(messageCount, index))
+                restoreProgress.onNext(BackupRepository.Progress.Running(messageCount, index))
 
-            try {
-                if (message.isMms) {
-                    restoreMmsMessage(message)
-                } else {
-                    val values = contentValuesOf(
+                try {
+                    if (message.isMms) {
+                        restoreMmsMessage(message)
+                    } else {
+                        val values = contentValuesOf(
                             Telephony.Sms.TYPE to message.type,
                             Telephony.Sms.ADDRESS to message.address,
                             Telephony.Sms.DATE to message.date,
@@ -303,31 +347,45 @@ class BackupRepositoryImpl @Inject constructor(
                             Telephony.Sms.PROTOCOL to message.protocol,
                             Telephony.Sms.SERVICE_CENTER to message.serviceCenter,
                             Telephony.Sms.LOCKED to message.locked
-                    )
+                        )
 
-                    if (prefs.canUseSubId.get()) {
-                        values.put(Telephony.Sms.SUBSCRIPTION_ID, message.subId)
+                        if (prefs.canUseSubId.get()) {
+                            values.put(Telephony.Sms.SUBSCRIPTION_ID, message.subId)
+                        }
+
+                        if (context.contentResolver.insert(Telephony.Sms.CONTENT_URI, values) == null) {
+                            errorCount++
+                            Timber.w("SMS restore insert returned no URI for item " + (index + 1))
+                        }
                     }
-
-                    context.contentResolver.insert(Telephony.Sms.CONTENT_URI, values)
+                } catch (error: Exception) {
+                    Timber.w(error, "Failed to restore message " + (index + 1) + "/" + messageCount)
+                    errorCount++
                 }
-            } catch (e: Exception) {
-                Timber.w(e)
-                errorCount++
             }
+
+            if (cancelled || stopFlag) {
+                stopFlag = false
+                cancelOperation(restoreProgress)
+                return
+            }
+
+            if (errorCount > 0) {
+                Timber.w("Failed to restore " + errorCount + "/" + messageCount + " messages")
+            }
+
+            // The provider writes above are not reflected in Realm until a full sync completes.
+            // Keep Restore in the Syncing state until that asynchronous sync really reaches Idle.
+            restoreProgress.onNext(BackupRepository.Progress.Syncing())
+            // If another full sync was already running, queue a fresh pass so it cannot
+            // finish before the restored provider rows are included in Realm.
+            syncRepo.syncMessagesAndAwait().blockingAwait()
+
+            finishOperation(restoreProgress)
+        } catch (error: Exception) {
+            stopFlag = false
+            failOperation(restoreProgress, error)
         }
-
-        if (errorCount > 0) {
-            Timber.w(Exception("Failed to backup $errorCount/$messageCount messages"))
-        }
-
-        // Sync the messages
-        restoreProgress.onNext(BackupRepository.Progress.Syncing())
-        syncRepo.syncMessages()
-
-        // Mark the task finished, and set it as Idle a second later
-        restoreProgress.onNext(BackupRepository.Progress.Finished())
-        Timer().schedule(1000) { restoreProgress.onNext(BackupRepository.Progress.Idle()) }
     }
 
     /**
@@ -412,10 +470,6 @@ class BackupRepositoryImpl @Inject constructor(
 
     override fun stopRestore() {
         stopFlag = true
-    }
-
-    private fun isBackupOrRestoreRunning(): Boolean {
-        return backupProgress.blockingFirst().running || restoreProgress.blockingFirst().running
     }
 
 }

@@ -1,5 +1,72 @@
 [
   {
+    "versionCode": 2268,
+    "versionName": "2.4.7",
+    "fixed": [
+      "Full sync repeats once when incremental message writes arrive during an active rebuild, preventing late provider rows from being dropped",
+      "Synchronous SMS/MMS dispatch failures now move messages to Failed instead of leaving them stuck in Outbox"
+    ]
+  },
+  {
+    "versionCode": 2267,
+    "versionName": "2.4.6",
+    "fixed": [
+      "Live tab Realm results are created on the main thread when the app resumes",
+      "Top conversation ranking excludes trashed messages from recent-message counts",
+      "Full sync closes provider cursors even when a later cursor query fails",
+      "Malformed legacy blocked-sender entries no longer abort full sync",
+      "Phone-number tests now use a deterministic US locale and restore the original locale afterward"
+    ]
+  },
+  {
+    "versionCode": 2266,
+    "versionName": "2.4.5",
+    "fixed": [
+      "MMS backups preserve every provider-backed attachment type, including documents and generic binary files",
+      "Restore queues a fresh full sync behind any sync already in progress before reporting completion",
+      "Full sync closes all provider cursors on success and failure paths",
+      "MMS downloads read the complete response file even when a stream returns partial reads"
+    ]
+  },
+  {
+    "versionCode": 2265,
+    "versionName": "2.4.4",
+    "fixed": [
+      "MMS downloads are acknowledged immediately after successful provider persistence, including when later app-side processing exits early",
+      "Backup and Restore cannot start concurrently, and restore completion waits for the full message sync",
+      "Failed backup or restore operations now reset their progress state instead of leaving the service stuck",
+      "Notification message ID snapshots use completed Realm queries instead of iterating unloaded async results",
+      "Unmanaged contact and message snapshots close the Realm instance used to copy them",
+      "Emoji-reparse transactions close their owning Realm instances after completion",
+      "SMS sending reports failure when SmsManager throws, and image bounds streams are closed safely"
+    ]
+  },
+
+  {
+    "versionCode": 2264,
+    "versionName": "2.4.3",
+    "fixed": [
+      "Full sync is serialized until emoji parsing finishes, and its Realm handle is closed on every completion path",
+      "Failed Contacts, contact-group, or MMS-part provider queries no longer get treated as valid empty results",
+      "Contacts, contact-group, conversation, and MMS-part provider cursors are closed after mapping",
+      "Search cancels stale queries so older results cannot overwrite the current search",
+      "Housekeeping respects the delayed-attachment cache retention age and tolerates malformed scheduled-folder names",
+      "Conversation row recycling restores non-draft text styling",
+      "Unknown sender addresses are cached in the Starred tab to avoid repeated full contact scans"
+    ]
+  },
+  {
+    "versionCode": 2263,
+    "versionName": "2.4.2",
+    "fixed": [
+      "Full message sync preserves Trash, starred messages, OTP tags, and categories instead of resetting Foxhole-only message state",
+      "Incremental sync preserves local message state when an existing provider message is refreshed",
+      "Contact names are linked only when phone-number matching identifies one unambiguous contact",
+      "Search, unread counts, attachment browsing, and duplicate cleanup ignore trashed messages",
+      "A failed SMS/MMS provider query no longer clears the local message database"
+    ]
+  },
+  {
     "versionCode": 2262,
     "versionName": "2.4.1",
     "added": [

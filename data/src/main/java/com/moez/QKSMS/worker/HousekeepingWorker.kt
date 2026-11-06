@@ -87,15 +87,18 @@ class HousekeepingWorker(appContext: Context, workerParams: WorkerParameters)
 
     private fun removeOrphanedScheduledMessageAttachmentFiles() {
         // get list of all scheduled message ids
-        val scheduledMessageIds = scheduledMessageRepository.getAllScheduledMessageIdsSnapshot()
+        val scheduledMessageIds = scheduledMessageRepository.getAllScheduledMessageIdsSnapshot().toHashSet()
 
         // remove orphaned scheduled message dirs in files dir
         File(applicationContext.filesDir,"")
             // get dirs that match prefix 'scheduled-'
             .listFiles { entry -> entry.isDirectory && entry.name.startsWith(Constants.SCHEDULED_MESSAGE_FILE_PREFIX) }
             // filter out any dirs that have an associated scheduled message in db
-            ?.filterNot {
-                scheduledMessageIds.contains(it.name.substringAfter('-').toLong())
+            ?.filterNot { directory ->
+                val messageId = directory.name
+                    .removePrefix(Constants.SCHEDULED_MESSAGE_FILE_PREFIX)
+                    .toLongOrNull()
+                messageId != null && messageId in scheduledMessageIds
             }
             // recursively delete orphan dir
             ?.forEach { it.deleteRecursively() }
@@ -122,8 +125,8 @@ class HousekeepingWorker(appContext: Context, workerParams: WorkerParameters)
         // find dirs in cache dir
         applicationContext.cacheDir.listFiles { entry ->
             entry.isDirectory &&
-                    entry.name.startsWith(Constants.DELAY_CANCELLED_CACHED_ATTACHMENTS_FILE_PREFIX)
-                    (entry.lastModified() < removeOlderThan)
+                    entry.name.startsWith(Constants.DELAY_CANCELLED_CACHED_ATTACHMENTS_FILE_PREFIX) &&
+                    entry.lastModified() < removeOlderThan
         }?.forEach { it.deleteRecursively() }  // recursively delete dir
 
 }

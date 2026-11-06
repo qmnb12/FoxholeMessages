@@ -1,7 +1,10 @@
-name: Build and Test on Pull Request
+name: Build, Test and APK Artifact
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - master
   pull_request:
     branches:
       - master
@@ -33,13 +36,7 @@ jobs:
     - name: Build with Gradle
       run: ./gradlew assembleDebug
 
-    - name: Run Android Lint
-      run: ./gradlew lint
-
-    - name: Run Tests
-      run: ./gradlew test
-
-    - name: List APK Output Directory 
+    - name: List APK Output Directory
       run: ls -R presentation/build/outputs/apk/debug
 
     - name: Rename APK
@@ -47,7 +44,7 @@ jobs:
       run: |
         set -euo pipefail
         shopt -s nullglob
-        mapfile -t apk_files < <(printf '%s\n' presentation/build/outputs/apk/debug/FoxholeMessages-v*-debug.apk)
+        apk_files=(presentation/build/outputs/apk/debug/FoxholeMessages-v*-debug.apk)
         if [[ "${#apk_files[@]}" -eq 0 ]]; then
           echo "No APK found matching FoxholeMessages-v*-debug.apk" >&2
           exit 1
@@ -58,8 +55,20 @@ jobs:
         fi
         mv "${apk_files[0]}" presentation/build/outputs/apk/debug/FoxholeMessages-debug.apk
 
+    # Upload before lint/tests so a test failure does not hide a buildable APK.
     - name: Upload App
       uses: actions/upload-artifact@v7
       with:
         name: apk-debug
         path: presentation/build/outputs/apk/debug/FoxholeMessages-debug.apk
+        if-no-files-found: error
+        retention-days: 30
+
+    - name: Run Android Lint
+      run: ./gradlew lint
+
+    - name: Run Tests
+      run: ./gradlew test
+
+    - name: Compile Android instrumentation tests
+      run: ./gradlew :data:assembleDebugAndroidTest

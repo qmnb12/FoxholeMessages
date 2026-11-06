@@ -133,7 +133,11 @@ open class MessageRepositoryImpl @Inject constructor(
 
     override fun getUnmanagedMessage(messageId: Long) =
         Realm.getDefaultInstance().use { realm ->
-            getMessage(messageId)?.let(realm::copyFromRealm)
+            realm.refresh()
+            realm.where(Message::class.java)
+                .equalTo("id", messageId)
+                .findFirst()
+                ?.let(realm::copyFromRealm)
         }
 
     override fun getMessages(messageIds: Collection<Long>): RealmResults<Message> =
@@ -147,6 +151,7 @@ open class MessageRepositoryImpl @Inject constructor(
         Realm.getDefaultInstance()
             .where(Message::class.java)
             .equalTo("parts.id", id)
+            .isNull("deletedAt")
             .findFirst()
 
     override fun getLastIncomingMessage(threadId: Long): RealmResults<Message> =
@@ -177,6 +182,7 @@ open class MessageRepositoryImpl @Inject constructor(
                 .equalTo("archived", false)
                 .equalTo("blocked", false)
                 .equalTo("lastMessage.read", false)
+                .isNull("lastMessage.deletedAt")
                 .count()
         }
 
@@ -196,6 +202,7 @@ open class MessageRepositoryImpl @Inject constructor(
             realm.where(Message::class.java)
                 .equalTo("read", false)
                 .equalTo("threadId", threadId)
+                .isNull("deletedAt")
                 .count()
         }
 
@@ -209,6 +216,7 @@ open class MessageRepositoryImpl @Inject constructor(
         Realm.getDefaultInstance()
             .where(MmsPart::class.java)
             .equalTo("messages.threadId", threadId)
+            .isNull("messages.deletedAt")
             .beginGroup()
             .contains("type", "image/")
             .or()
@@ -616,13 +624,17 @@ open class MessageRepositoryImpl @Inject constructor(
 
                     // Get the image dimensions
                     val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-                    BitmapFactory.decodeStream(
-                        context.contentResolver.openInputStream(uri),
-                        null,
-                        options
-                    )
+                    val boundsRead = context.contentResolver.openInputStream(uri)?.use { stream ->
+                        BitmapFactory.decodeStream(stream, null, options)
+                        options.outWidth > 0 && options.outHeight > 0
+                    } ?: false
                     val width = options.outWidth
                     val height = options.outHeight
+                    if (!boundsRead || width <= 0 || height <= 0) {
+                        Timber.w("Unable to read image bounds; keeping the existing image bytes")
+                        attachment.releaseResourceBytes()
+                        return@forEach
+                    }
                     val aspectRatio = width.toFloat() / height.toFloat()
 
                     var attempts = 0
@@ -775,8 +787,16 @@ open class MessageRepositoryImpl @Inject constructor(
                     else null
 
                 // use values from os provider to resend the message, except subId
-                if (!QkTransaction.sendMessage(context, message.getUri(), sentIntent, deliveryIntent))
+                val sendAccepted = try {
+                    QkTransaction.sendMessage(context, message.getUri(), sentIntent, deliveryIntent)
+                } catch (error: Exception) {
+                    Timber.e(error, "message id ${message.id} failed before SMS/MMS dispatch")
+                    false
+                }
+                if (!sendAccepted) {
                     Timber.e("message id ${message.id} not sent by smsmms")
+                    markFailed(message.id, SmsManager.RESULT_ERROR_GENERIC_FAILURE)
+                }
             }
 
             retVal.add(message)
@@ -1243,6 +1263,7 @@ open class MessageRepositoryImpl @Inject constructor(
 
         Realm.getDefaultInstance().use { realm ->
             val allMessages = realm.where(Message::class.java)
+                .isNull("deletedAt")
                 .sort("id", Sort.ASCENDING)
                 .findAll()
 

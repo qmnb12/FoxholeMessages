@@ -47,6 +47,7 @@ import dev.octoshrimpy.quik.manager.PermissionManager
 import dev.octoshrimpy.quik.manager.RatingManager
 import dev.octoshrimpy.quik.model.Conversation
 import dev.octoshrimpy.quik.model.EmojiSyncNeeded
+import dev.octoshrimpy.quik.model.SearchResult
 import dev.octoshrimpy.quik.model.SyncLog
 import dev.octoshrimpy.quik.repository.ConversationRepository
 import dev.octoshrimpy.quik.repository.EmojiReactionRepository
@@ -101,7 +102,9 @@ class MainViewModel @Inject constructor(
         page = Inbox(data = conversationRepo.getConversations(prefs.unreadAtTop.get())),
         tabData = buildTabData(conversationRepo, prefs.unreadAtTop.get()),
         starredMessages = messageRepo.getStarredMessages(),
-        tabUnreadCounts = buildTabUnreadCounts(conversationRepo, messageRepo)
+        // Badge counts are loaded asynchronously in init so Realm count queries do not block
+        // the main thread while the first screen is being created.
+        tabUnreadCounts = emptyMap()
     )
 ) {
     companion object {
@@ -112,6 +115,8 @@ class MainViewModel @Inject constructor(
     private var lastArchivedThreadIds = listOf<Long>(0)
 
     init {
+        refreshTabUnreadCounts()
+
         disposables += deleteConversations
         disposables += markAllSeen
         disposables += markArchived
@@ -155,13 +160,28 @@ class MainViewModel @Inject constructor(
             syncMessages.execute(Unit)
         }
 
-        // This is only used when we update to a version that newly supports emoji reactions
-        Realm.getDefaultInstance().executeTransactionAsync { realm ->
-            val emojiSyncNeeded = realm.where(EmojiSyncNeeded::class.java).findFirst()
-            if (emojiSyncNeeded != null) {
-                reactions.deleteAndReparseAllEmojiReactions(realm) { /* No progress ui needed here */ }
-                emojiSyncNeeded.deleteFromRealm()
-            }
+        // This is only used when we update to a version that newly supports emoji reactions.
+        // Keep the owner Realm open until its async transaction callback runs, then close it on
+        // the same thread that created it.
+        val legacyEmojiSyncRealm = Realm.getDefaultInstance()
+        try {
+            legacyEmojiSyncRealm.executeTransactionAsync(
+                { realm ->
+                    val emojiSyncNeeded = realm.where(EmojiSyncNeeded::class.java).findFirst()
+                    if (emojiSyncNeeded != null) {
+                        reactions.deleteAndReparseAllEmojiReactions(realm) { /* No progress ui needed here */ }
+                        emojiSyncNeeded.deleteFromRealm()
+                    }
+                },
+                { legacyEmojiSyncRealm.close() },
+                { error ->
+                    legacyEmojiSyncRealm.close()
+                    Timber.e(error, "Legacy emoji sync migration failed")
+                }
+            )
+        } catch (error: Exception) {
+            legacyEmojiSyncRealm.close()
+            Timber.e(error, "Unable to schedule legacy emoji sync migration")
         }
 
         // The EmojiSyncNeeded row above is created by a schema migration, so it only ever fires
@@ -169,15 +189,27 @@ class MainViewModel @Inject constructor(
         // EMOJI_REPARSE_VERSION is bumped, to recover reaction messages that were received while
         // recognition wasn't working and are now sitting in threads as plain text.
         if (prefs.emojiReparseVersion.get() < EMOJI_REPARSE_VERSION) {
-            Timber.i("Emoji reparse requested (stored=${prefs.emojiReparseVersion.get()}, current=$EMOJI_REPARSE_VERSION)")
-            Realm.getDefaultInstance().executeTransactionAsync({ realm ->
-                reactions.deleteAndReparseAllEmojiReactions(realm) { /* No progress ui needed here */ }
-            }, {
-                prefs.emojiReparseVersion.set(EMOJI_REPARSE_VERSION)
-                Timber.i("Emoji reparse finished")
-            }, { error ->
-                Timber.e(error, "Emoji reparse failed")
-            })
+            Timber.i("Emoji reparse requested")
+            val emojiReparseRealm = Realm.getDefaultInstance()
+            try {
+                emojiReparseRealm.executeTransactionAsync(
+                    { realm ->
+                        reactions.deleteAndReparseAllEmojiReactions(realm) { /* No progress ui needed here */ }
+                    },
+                    {
+                        emojiReparseRealm.close()
+                        prefs.emojiReparseVersion.set(EMOJI_REPARSE_VERSION)
+                        Timber.i("Emoji reparse finished")
+                    },
+                    { error ->
+                        emojiReparseRealm.close()
+                        Timber.e(error, "Emoji reparse failed")
+                    }
+                )
+            } catch (error: Exception) {
+                emojiReparseRealm.close()
+                Timber.e(error, "Unable to schedule emoji reparse")
+            }
         }
 
         // Sync contacts when we detect a change
@@ -207,19 +239,21 @@ class MainViewModel @Inject constructor(
             .debounce(400, TimeUnit.MILLISECONDS)
             .observeOn(AndroidSchedulers.mainThread())
             .withLatestFrom(state) { _, state ->
-                if (state.page is Inbox)
+                if (state.page is Inbox) {
                     newState {
                         copy(
                             page = Inbox(data = conversationRepo.getConversations(prefs.unreadAtTop.get())),
                             tabData = buildTabData(conversationRepo, prefs.unreadAtTop.get()),
                             starredMessages = messageRepo.getStarredMessages(),
-                            tabUnreadCounts = buildTabUnreadCounts(conversationRepo, messageRepo)
+                            tabUnreadCounts = emptyMap()
                         )
                     }
-                else if (state.page is Archived)
+                    refreshTabUnreadCounts()
+                } else if (state.page is Archived) {
                     newState {
                         copy(page = Inbox(data = conversationRepo.getConversations(prefs.unreadAtTop.get(), true)))
                     }
+                }
             }
             .autoDisposable(view.scope())
             .subscribe()
@@ -305,27 +339,51 @@ class MainViewModel @Inject constructor(
                 .subscribe { externalNavigator.showChangelog() }
 
         view.queryChangedIntent
-                .debounce(200, TimeUnit.MILLISECONDS)
-                .observeOn(AndroidSchedulers.mainThread())
-                .map { query -> query.trim() }
-                .withLatestFrom(state) { query, state ->
-                    if (query.isEmpty() && state.page is Searching) {
-                        newState { copy(page = Inbox(data = conversationRepo.getConversations(prefs.unreadAtTop.get()))) }
-                    }
-                    query
-                }
-                .filter { query -> query.length >= 2 }
-                .distinctUntilChanged()
-                .doOnNext {
+            .debounce(200, TimeUnit.MILLISECONDS)
+            .observeOn(AndroidSchedulers.mainThread())
+            .map { query -> query.trim() }
+            .distinctUntilChanged()
+            .doOnNext { query ->
+                if (query.length < 2) {
                     newState {
-                        val page = (page as? Searching) ?: Searching()
-                        copy(page = page.copy(loading = true))
+                        if (page is Searching) {
+                            copy(page = Inbox(data = conversationRepo.getConversations(prefs.unreadAtTop.get())))
+                        } else {
+                            this
+                        }
+                    }
+                } else {
+                    newState {
+                        val searchPage = (page as? Searching) ?: Searching()
+                        copy(page = searchPage.copy(loading = true, data = null))
                     }
                 }
-                .observeOn(Schedulers.io())
-                .map(conversationRepo::searchConversations)
-                .autoDisposable(view.scope())
-                .subscribe { data -> newState { copy(page = Searching(loading = false, data = data)) } }
+            }
+            // switchMap prevents a slow older query from overwriting results for newer text.
+            .switchMap { query ->
+                if (query.length < 2) {
+                    Observable.empty<List<SearchResult>>()
+                } else {
+                    Observable.fromCallable { conversationRepo.searchConversations(query) }
+                        .subscribeOn(Schedulers.io())
+                        .onErrorReturn { error ->
+                            Timber.e(error, "Conversation search failed")
+                            emptyList()
+                        }
+                }
+            }
+            .observeOn(AndroidSchedulers.mainThread())
+            .autoDisposable(view.scope())
+            .subscribe { data ->
+                newState {
+                    val searchPage = page as? Searching
+                    if (searchPage != null) {
+                        copy(page = searchPage.copy(loading = false, data = data))
+                    } else {
+                        this
+                    }
+                }
+            }
 
         view.activityResumedIntent
                 .filter { resumed -> !resumed }
@@ -704,17 +762,34 @@ class MainViewModel @Inject constructor(
         // while the process was backgrounded and missed the live listeners above
         view.activityResumedIntent
             .filter { resumed -> resumed }
-            .observeOn(Schedulers.io())
+            // These are live RealmResults consumed by UI adapters, so create them on
+            // the main thread. Only the scalar unread counts are moved to IO below.
+            .observeOn(AndroidSchedulers.mainThread())
             .autoDisposable(view.scope())
             .subscribe {
                 newState {
                     copy(
                         tabData = buildTabData(conversationRepo, prefs.unreadAtTop.get()),
-                        starredMessages = messageRepo.getStarredMessages(),
-                        tabUnreadCounts = buildTabUnreadCounts(conversationRepo, messageRepo)
+                        starredMessages = messageRepo.getStarredMessages()
                     )
                 }
+                refreshTabUnreadCounts()
             }
+    }
+
+    /**
+     * Badge counts are Realm count queries across several categories. Run them away from the
+     * main thread both on startup and when the unread-sort preference changes.
+     */
+    private fun refreshTabUnreadCounts() {
+        disposables += Observable.fromCallable {
+            buildTabUnreadCounts(conversationRepo, messageRepo)
+        }
+            .subscribeOn(Schedulers.io())
+            .subscribe(
+                { unreadCounts -> newState { copy(tabUnreadCounts = unreadCounts) } },
+                { error -> Timber.e(error, "Unable to load unread-count badges") }
+            )
     }
 
 }

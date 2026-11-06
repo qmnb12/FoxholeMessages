@@ -1,6 +1,7 @@
 # FOXHOLE MESSAGES
 
-[![Manual Release](https://github.com/curly815/foxholemessages/actions/workflows/manual-release.yml/badge.svg)](https://github.com/curly815/foxholemessages/actions/workflows/manual-release.yml)
+[![Build, Test and APK Artifact](https://github.com/qmnb12/FoxholeMessages/actions/workflows/build-on-pull.yml/badge.svg)](https://github.com/qmnb12/FoxholeMessages/actions/workflows/build-on-pull.yml)
+[![Manual Release](https://github.com/qmnb12/FoxholeMessages/actions/workflows/manual-release.yml/badge.svg)](https://github.com/qmnb12/FoxholeMessages/actions/workflows/manual-release.yml)
 
 Foxhole Message is an open source Blend of QUIK SMS and other features i wanted add. RIP Samsung Messages and the soon to be RIP of Microsoft SMS Organizer. 
 
@@ -22,7 +23,13 @@ Foxhole Message is an open source Blend of QUIK SMS and other features i wanted 
 
 ## Download
 
-Grab Foxhole Messages from the official [github releases page](https://github.com/curly815/foxholemessages/releases), or keep up with updates with the following:
+Grab Foxhole Messages from the [qmnb12 GitHub releases page](https://github.com/qmnb12/FoxholeMessages/releases).
+
+### Download the latest debug APK
+
+Every push to `master` builds a debug APK. Open [Actions → Build, Test and APK Artifact](https://github.com/qmnb12/FoxholeMessages/actions/workflows/build-on-pull.yml), open the latest run, and download the **apk-debug** artifact. The debug APK uses the separate `com.foxhole.messages.debug` application ID, so it can be installed alongside a release build.
+
+Or download the latest published release from GitHub:
 
 <img src="https://user-images.githubusercontent.com/69304392/148696068-0cfea65d-b18f-4685-82b5-329a330b1c0d.png"
 alt="Download from GitHub releases" height="100" /></a>

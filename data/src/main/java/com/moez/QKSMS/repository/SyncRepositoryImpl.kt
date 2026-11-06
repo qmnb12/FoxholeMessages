@@ -48,6 +48,8 @@ import dev.octoshrimpy.quik.model.SyncLog
 import dev.octoshrimpy.quik.interactor.DeduplicateMessages
 import dev.octoshrimpy.quik.util.PhoneNumberUtils
 import dev.octoshrimpy.quik.util.tryOrNull
+import io.reactivex.Completable
+import io.reactivex.CompletableEmitter
 import io.reactivex.android.schedulers.AndroidSchedulers
 import io.reactivex.subjects.BehaviorSubject
 import io.reactivex.subjects.Subject
@@ -80,18 +82,124 @@ class SyncRepositoryImpl @Inject constructor(
     override val syncProgress: Subject<SyncRepository.SyncProgress> =
             BehaviorSubject.createDefault(SyncRepository.SyncProgress.Idle)
 
+    // Keep the full rebuild guarded through emoji parsing. ParsingEmojis is still part of the
+    // same operation and must not admit a second destructive rebuild.
+    private val syncLock = Any()
+    private var syncInProgress = false
+    private var incrementalSyncObservedDuringFullSync = false
+
+    private val activeSyncWaiters = mutableListOf<CompletableEmitter>()
+    private val queuedSyncWaiters = mutableListOf<CompletableEmitter>()
+
+    /**
+     * Finish the current rebuild. Restore requests made during an existing sync are queued
+     * separately and trigger another rebuild before their Completable is completed.
+     */
+    private fun finishSync(error: Throwable? = null) {
+        val (completedWaiters, startQueuedSync) = synchronized(syncLock) {
+            val completed = activeSyncWaiters.toList()
+            activeSyncWaiters.clear()
+            queuedSyncWaiters.removeAll { emitter -> emitter.isDisposed }
+
+            val startNext = queuedSyncWaiters.isNotEmpty() || incrementalSyncObservedDuringFullSync
+            incrementalSyncObservedDuringFullSync = false
+            if (startNext) {
+                activeSyncWaiters.addAll(queuedSyncWaiters)
+                queuedSyncWaiters.clear()
+                syncProgress.onNext(SyncRepository.SyncProgress.Running(0, 0, true))
+            } else {
+                syncInProgress = false
+                syncProgress.onNext(SyncRepository.SyncProgress.Idle)
+            }
+
+            Pair(completed, startNext)
+        }
+
+        completedWaiters.forEach { emitter ->
+            if (!emitter.isDisposed) {
+                if (error == null) emitter.onComplete() else emitter.onError(error)
+            }
+        }
+
+        if (startQueuedSync) performSync()
+    }
+
     override fun syncMessages() {
+        val started = synchronized(syncLock) {
+            if (syncInProgress) {
+                false
+            } else {
+                syncInProgress = true
+                syncProgress.onNext(SyncRepository.SyncProgress.Running(0, 0, true))
+                true
+            }
+        }
 
-        val oldBlockedSenders = rxPrefs.getStringSet("pref_key_blocked_senders")
+        if (started) performSync()
+    }
 
-        // If the sync is already running, don't try to do another one
-        if (syncProgress.blockingFirst() is SyncRepository.SyncProgress.Running) return
-        syncProgress.onNext(SyncRepository.SyncProgress.Running(0, 0, true))
+    override fun syncMessagesAndAwait(): Completable = Completable.create { emitter ->
+        val shouldStart = synchronized(syncLock) {
+            if (syncInProgress) {
+                queuedSyncWaiters.add(emitter)
+                false
+            } else {
+                syncInProgress = true
+                activeSyncWaiters.add(emitter)
+                syncProgress.onNext(SyncRepository.SyncProgress.Running(0, 0, true))
+                true
+            }
+        }
+
+        emitter.setCancellable {
+            synchronized(syncLock) {
+                activeSyncWaiters.remove(emitter)
+                queuedSyncWaiters.remove(emitter)
+            }
+        }
+
+        if (shouldStart) performSync()
+    }
+
+    private fun performSync() {
+        val oldBlockedSenders = try {
+            rxPrefs.getStringSet("pref_key_blocked_senders")
+        } catch (error: Exception) {
+            Timber.e(error, "Unable to read blocked-sender migration preference")
+            finishSync(error)
+            return
+        }
 
         val handlerThread = HandlerThread("RealmSyncThread")
-        handlerThread.start()
-        Handler(handlerThread.looper).post {
-            Realm.getDefaultInstance().executeTransactionAsync(
+        try {
+            handlerThread.start()
+        } catch (error: Exception) {
+            Timber.e(error, "Unable to start Realm sync thread")
+            finishSync(error)
+            return
+        }
+
+        val taskPosted = Handler(handlerThread.looper).post {
+            // Read the contacts provider before opening the long Realm write transaction.
+            val syncedContacts = try {
+                getContacts()
+            } catch (error: Exception) {
+                handlerThread.quitSafely()
+                Timber.e(error, "Unable to read contacts for full sync")
+                finishSync(error)
+                return@post
+            }
+
+            val syncRealm = try {
+                Realm.getDefaultInstance()
+            } catch (error: Exception) {
+                handlerThread.quitSafely()
+                Timber.e(error, "Unable to open Realm for full sync")
+                finishSync(error)
+                return@post
+            }
+            try {
+                syncRealm.executeTransactionAsync(
                 { realm ->
                 // Prepare existing conversation data
                 val persistedData = realm.copyFromRealm(
@@ -108,18 +216,43 @@ class SyncRepositoryImpl @Inject constructor(
                         .isNotNull("blockingClient")
                         .or()
                         .isNotEmpty("blockReason")
+                        .or()
+                        .isNotNull("categoryOverride")
+                        .or()
+                        .equalTo("sendAsGroup", false)
                         .endGroup()
                         .findAll()
                 ).associateBy { conversation -> conversation.id }.toMutableMap()
 
+                // Full sync rebuilds Realm messages from Android's provider. Snapshot state
+                // owned by Foxhole first, using the provider identity which survives a rebuild.
+                val persistedMessageState = realm.where(Message::class.java)
+                    .findAll()
+                    .filter { message -> message.contentId != 0L }
+                    .associate { message ->
+                        (message.type to message.contentId) to MessageSyncState.from(message)
+                    }
+
+                val providerCursors = mutableListOf<android.database.Cursor>()
+                try {
+                    // Acquire every provider cursor before clearing local state. If any
+                    // provider query returns null or throws, already-open cursors are closed
+                    // by this finally block and the Realm rebuild is rolled back.
+                    val partsCursor = cursorToPart.getPartsCursor()
+                        ?.also { cursor -> providerCursors.add(cursor) }
+                        ?: throw IllegalStateException("MMS parts provider cursor unavailable")
+                    val messageCursor = cursorToMessage.getMessagesCursor()
+                        ?.also { cursor -> providerCursors.add(cursor) }
+                        ?: throw IllegalStateException("Messages provider cursor unavailable")
+                    val conversationCursor = cursorToConversation.getConversationsCursor()
+                        ?.also { cursor -> providerCursors.add(cursor) }
+                        ?: throw IllegalStateException("Conversations provider cursor unavailable")
+                    val recipientCursor = cursorToRecipient.getRecipientCursor()
+                        ?.also { cursor -> providerCursors.add(cursor) }
+                        ?: throw IllegalStateException("Recipients provider cursor unavailable")
+
                 removeOldMessages(realm)
-
                 keys.reset()
-
-                val partsCursor = cursorToPart.getPartsCursor()
-                val messageCursor = cursorToMessage.getMessagesCursor()
-                val conversationCursor = cursorToConversation.getConversationsCursor()
-                val recipientCursor = cursorToRecipient.getRecipientCursor()
 
                 val max = (partsCursor?.count ?: 0) +
                         (messageCursor?.count ?: 0) +
@@ -139,6 +272,12 @@ class SyncRepositoryImpl @Inject constructor(
                     }
                 }
 
+                // Build the MMS-part lookup once. Querying Realm once for every MMS message
+                // made large full syncs perform an avoidable N+1 sequence of database queries.
+                val partsByMessageId = realm.where(MmsPart::class.java)
+                    .findAll()
+                    .groupBy { part -> part.messageId }
+
                 // Sync messages
                 messageCursor?.use {
                     val messageColumns = CursorToMessage.MessageColumns(messageCursor)
@@ -152,12 +291,11 @@ class SyncRepositoryImpl @Inject constructor(
                                 )
                             )
                             val message = cursorToMessage.map(Pair(cursor, messageColumns)).apply {
+                                persistedMessageState[type to contentId]?.applyTo(this)
                                 if (isMms()) {
                                     parts = RealmList<MmsPart>().apply {
                                         addAll(
-                                            realm.where(MmsPart::class.java)
-                                                .equalTo("messageId", contentId)
-                                                .findAll()
+                                            partsByMessageId[contentId].orEmpty()
                                         )
                                     }
                                 }
@@ -167,9 +305,22 @@ class SyncRepositoryImpl @Inject constructor(
                     }
                 }
 
+                // Precompute each thread's newest non-trashed message once. Previously the
+                // conversation cursor loop issued one Realm query per conversation.
+                val latestMessagesByThreadId = HashMap<Long, Message>()
+                realm.where(Message::class.java)
+                    .isNull("deletedAt")
+                    .sort("date", Sort.DESCENDING)
+                    .findAll()
+                    .forEach { message ->
+                        if (!latestMessagesByThreadId.containsKey(message.threadId)) {
+                            latestMessagesByThreadId[message.threadId] = message
+                        }
+                    }
+
                 // Migrate blocked conversations from 2.7.3
                 oldBlockedSenders.get()
-                    .map { threadIdString -> threadIdString.toLong() }
+                    .mapNotNull { threadIdString -> threadIdString.toLongOrNull() }
                     .filter { threadId -> !persistedData.contains(threadId) }
                     .forEach { threadId ->
                         persistedData[threadId] = Conversation(id = threadId, blocked = true)
@@ -195,11 +346,9 @@ class SyncRepositoryImpl @Inject constructor(
                                     blockingClient = persistedConversation.blockingClient
                                     blockReason = persistedConversation.blockReason
                                     sendAsGroup = persistedConversation.sendAsGroup
+                                    categoryOverride = persistedConversation.categoryOverride
                                 }
-                                lastMessage = realm.where(Message::class.java)
-                                    .sort("date", Sort.DESCENDING)
-                                    .equalTo("threadId", id)
-                                    .findFirst()
+                                lastMessage = latestMessagesByThreadId[id]
                             }
                             realm.insertOrUpdate(conversation)
                         }
@@ -207,7 +356,8 @@ class SyncRepositoryImpl @Inject constructor(
                 }
 
                 // Sync recipients
-                val contacts = realm.copyToRealmOrUpdate(getContacts())
+                val contacts = realm.copyToRealmOrUpdate(syncedContacts)
+                val contactMatcher = phoneNumberUtils.contactMatcher(contacts)
                 recipientCursor?.use {
                     recipientCursor.forEach { cursor ->
                         tryOrNull {
@@ -219,14 +369,7 @@ class SyncRepositoryImpl @Inject constructor(
                                 )
                             )
                             val rec = cursorToRecipient.map(cursor).apply {
-                                contact = contacts.firstOrNull { c ->
-                                    c.numbers.any { num ->
-                                        phoneNumberUtils.compare(
-                                            address,
-                                            num.address
-                                        )
-                                    }
-                                }
+                                contact = contactMatcher.findUniqueContact(address)
                             }
                             realm.insertOrUpdate(rec)
                         }
@@ -262,16 +405,54 @@ class SyncRepositoryImpl @Inject constructor(
                 }
 
                 realm.insert(SyncLog())
-            }, {
-                handlerThread.quitSafely()
-                oldBlockedSenders.delete()
-                syncProgress.onNext(SyncRepository.SyncProgress.Idle)
-            },
+                } finally {
+                    providerCursors.forEach { cursor ->
+                        try {
+                            if (!cursor.isClosed) cursor.close()
+                        } catch (closeError: Exception) {
+                            Timber.w(closeError, "Unable to close provider cursor after sync")
+                        }
+                    }
+                }
+                }, {
+                    try {
+                        oldBlockedSenders.delete()
+                    } catch (error: Exception) {
+                        Timber.w(error, "Unable to clear migrated blocked-sender preference")
+                    } finally {
+                        try {
+                            syncRealm.close()
+                        } catch (closeError: Exception) {
+                            Timber.w(closeError, "Unable to close Realm after sync")
+                        }
+                        handlerThread.quitSafely()
+                        finishSync()
+                    }
+                },
                 { error ->
+                    try {
+                        syncRealm.close()
+                    } catch (closeError: Exception) {
+                        Timber.w(closeError, "Unable to close Realm after failed sync")
+                    }
                     handlerThread.quitSafely()
                     Timber.e(error, "syncMessages Failed")
-                    syncProgress.onNext(SyncRepository.SyncProgress.Idle)
+                    finishSync(error)
                 })
+            } catch (error: Exception) {
+                try {
+                    syncRealm.close()
+                } catch (closeError: Exception) {
+                    Timber.w(closeError, "Unable to close Realm after sync scheduling failure")
+                }
+                handlerThread.quitSafely()
+                Timber.e(error, "Unable to schedule syncMessages transaction")
+                finishSync(error)
+            }
+        }
+        if (!taskPosted) {
+            handlerThread.quitSafely()
+            finishSync(IllegalStateException("Unable to schedule full sync on Realm thread"))
         }
     }
 
@@ -287,8 +468,14 @@ class SyncRepositoryImpl @Inject constructor(
         // If we don't have a valid id, return null
         val contentId = tryOrNull(false) { ContentUris.parseId(uri) } ?: return null
 
+        // A full rebuild may already have captured its provider cursors. Remember incremental
+        // writes that arrive during that window and run one fresh full pass after this rebuild.
+        synchronized(syncLock) {
+            if (syncInProgress) incrementalSyncObservedDuringFullSync = true
+        }
+
         // Check if the message already exists, so we can reuse the id
-        val existingId = Realm.getDefaultInstance().use { realm ->
+        val existingMessageState = Realm.getDefaultInstance().use { realm ->
             realm.refresh()
             realm.where(Message::class.java)
                 .equalTo("type", type)
@@ -300,7 +487,7 @@ class SyncRepositoryImpl @Inject constructor(
                 .equalTo("contentId", 0L)
                 .endGroup()
                 .findFirst()
-                ?.id
+                ?.let { message -> message.id to MessageSyncState.from(message) }
         }
 
         // The uri might be something like content://mms/inbox/id
@@ -317,11 +504,17 @@ class SyncRepositoryImpl @Inject constructor(
 
             val columnsMap = CursorToMessage.MessageColumns(cursor)
             cursorToMessage.map(Pair(cursor, columnsMap)).apply {
-                existingId?.let { this.id = it }
+                existingMessageState?.let { (existingId, localState) ->
+                    this.id = existingId
+                    localState.applyTo(this)
+                }
 
                 if (isMms()) {
+                    // A null cursor means the provider lookup failed, not that this MMS has no
+                    // attachments. Leave the existing Realm message untouched on that failure.
+                    val partsCursor = cursorToPart.getPartsCursor(contentId) ?: return null
                     parts = RealmList<MmsPart>().apply {
-                        addAll(cursorToPart.getPartsCursor(contentId)?.map { cursorToPart.map(it) }.orEmpty())
+                        addAll(partsCursor.use { cursor -> cursor.map(cursorToPart::map) })
                     }
                 }
 
@@ -352,29 +545,37 @@ class SyncRepositoryImpl @Inject constructor(
     }
 
     override fun syncContacts() {
-        // Load all the contacts
-        var contacts = getContacts()
+        // Keep cross-process ContactsProvider reads outside the Realm write transaction. Holding
+        // Realm's write lock while querying the provider makes every other Realm writer wait.
+        val contacts = getContacts()
+        val contactGroups = getContactGroups(contacts)
 
-        Realm.getDefaultInstance()?.use { realm ->
+        Realm.getDefaultInstance().use { realm ->
             val recipients = realm.where(Recipient::class.java).findAll()
 
             realm.executeTransaction {
                 realm.delete(Contact::class.java)
                 realm.delete(ContactGroup::class.java)
 
-                contacts = realm.copyToRealmOrUpdate(contacts)
-                realm.insertOrUpdate(getContactGroups(contacts))
+                val managedContacts = realm.copyToRealmOrUpdate(contacts)
+                val contactMatcher = phoneNumberUtils.contactMatcher(managedContacts)
+                val contactsByLookupKey = managedContacts.associateBy { contact -> contact.lookupKey }
+
+                // Reconnect group members to the Contact objects managed by this Realm.
+                contactGroups.forEach { group ->
+                    val lookupKeys = group.contacts.map { contact -> contact.lookupKey }
+                    group.contacts.clear()
+                    group.contacts.addAll(lookupKeys.mapNotNull { lookupKey -> contactsByLookupKey[lookupKey] })
+                }
+                realm.insertOrUpdate(contactGroups)
 
                 // Update all the recipients with the new contacts
                 recipients.forEach { recipient ->
-                    recipient.contact = contacts.find { contact ->
-                        contact.numbers.any { phoneNumberUtils.compare(recipient.address, it.address) }
-                    }
+                    recipient.contact = contactMatcher.findUniqueContact(recipient.address)
                 }
 
                 realm.insertOrUpdate(recipients)
             }
-
         }
     }
 
@@ -384,50 +585,66 @@ class SyncRepositoryImpl @Inject constructor(
                     .equalTo("isDefault", true)
                     .findAll()
                     .map { number -> number.id }
+                    .toHashSet()
         }
 
-        return cursorToContact.getContactsCursor()
-                ?.map { cursor -> cursorToContact.map(cursor) }
-                ?.groupBy { contact -> contact.lookupKey }
-                ?.map { contacts ->
-                    // Sometimes, contacts providers on the phone will create duplicate phone number entries. This
-                    // commonly happens with Whatsapp. Let's try to detect these duplicate entries and filter them out
+        // Cursor.map() materializes rows but does not close its provider cursor. A null cursor
+        // means the provider query failed; treating it as an empty address book could erase data.
+        val contactsCursor = cursorToContact.getContactsCursor()
+            ?: throw IllegalStateException("Contacts provider cursor unavailable")
+
+        return contactsCursor.use { cursor ->
+            cursor.map(cursorToContact::map)
+                .groupBy { contact -> contact.lookupKey }
+                .map { contacts ->
+                    // Some providers expose duplicate phone-number rows for linked accounts.
                     val uniqueNumbers = mutableListOf<PhoneNumber>()
                     contacts.value
-                            .flatMap { it.numbers }
-                            .forEach { number ->
-                                number.isDefault = defaultNumberIds.any { id -> id == number.id }
-                                val duplicate = uniqueNumbers.find { other ->
-                                    phoneNumberUtils.compare(number.address, other.address)
-                                }
-
-                                if (duplicate == null) {
-                                    uniqueNumbers += number
-                                } else if (!duplicate.isDefault && number.isDefault) {
-                                    duplicate.isDefault = true
-                                }
+                        .flatMap { it.numbers }
+                        .forEach { number ->
+                            number.isDefault = number.id in defaultNumberIds
+                            val duplicate = uniqueNumbers.find { other ->
+                                phoneNumberUtils.compare(number.address, other.address)
                             }
+
+                            if (duplicate == null) {
+                                uniqueNumbers += number
+                            } else if (!duplicate.isDefault && number.isDefault) {
+                                duplicate.isDefault = true
+                            }
+                        }
 
                     contacts.value.first().apply {
                         numbers.clear()
                         numbers.addAll(uniqueNumbers)
                     }
-                } ?: listOf()
+                }
+        }
     }
 
     private fun getContactGroups(contacts: List<Contact>): List<ContactGroup> {
-        val groupMembers = cursorToContactGroupMember.getGroupMembersCursor()
-                ?.map(cursorToContactGroupMember::map)
-                .orEmpty()
+        val membersCursor = cursorToContactGroupMember.getGroupMembersCursor()
+            ?: throw IllegalStateException("Contact group-member cursor unavailable")
+        val groupMembers = membersCursor.use { cursor ->
+            cursor.map(cursorToContactGroupMember::map)
+        }
 
-        val groups = cursorToContactGroup.getContactGroupsCursor()
-                ?.map(cursorToContactGroup::map)
-                .orEmpty()
+        val groupsCursor = cursorToContactGroup.getContactGroupsCursor()
+            ?: throw IllegalStateException("Contact groups cursor unavailable")
+        val groups = groupsCursor.use { cursor ->
+            cursor.map(cursorToContactGroup::map)
+        }
+
+        // Index both sides once instead of scanning every member and contact for every group.
+        val contactsByLookupKey = contacts.associateBy { contact -> contact.lookupKey }
+        val membersByGroupId = groupMembers.groupBy { member -> member.groupId }
 
         groups.forEach { group ->
-            group.contacts.addAll(groupMembers
-                    .filter { member -> member.groupId == group.id }
-                    .mapNotNull { member -> contacts.find { contact -> contact.lookupKey == member.lookupKey } })
+            group.contacts.addAll(
+                membersByGroupId[group.id]
+                    .orEmpty()
+                    .mapNotNull { member -> contactsByLookupKey[member.lookupKey] }
+            )
         }
 
         return groups

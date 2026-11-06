@@ -20,9 +20,12 @@ package dev.octoshrimpy.quik.repository
 
 import androidx.test.InstrumentationRegistry
 import androidx.test.runner.AndroidJUnit4
+import dev.octoshrimpy.quik.model.Contact
+import dev.octoshrimpy.quik.model.PhoneNumber
 import dev.octoshrimpy.quik.util.PhoneNumberUtils
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.After
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -31,12 +34,21 @@ import java.util.Locale
 @RunWith(AndroidJUnit4::class)
 class PhoneNumberUtilsTest {
 
-    private val context = InstrumentationRegistry.getInstrumentation().context
-    private val phoneNumberUtils = PhoneNumberUtils(context)
+    private lateinit var phoneNumberUtils: PhoneNumberUtils
+    private lateinit var originalLocale: Locale
 
     @Before
     fun setup() {
+        originalLocale = Locale.getDefault()
         Locale.setDefault(Locale.US)
+        phoneNumberUtils = PhoneNumberUtils(
+            InstrumentationRegistry.getInstrumentation().targetContext
+        )
+    }
+
+    @After
+    fun tearDown() {
+        Locale.setDefault(originalLocale)
     }
 
     @Test
@@ -78,5 +90,53 @@ class PhoneNumberUtilsTest {
     fun compare_different_SenderID_returnsFalse() {
         assertFalse(phoneNumberUtils.compare("VM-ViCARE-S", "VZ-ViCARE-S"))
     }
+
+    @Test
+    fun findUniqueContact_exactMatch_returnsContact() {
+        val alice = contact("alice", "+1 123 456 7890")
+        val bob = contact("bob", "+1 222 333 4444")
+        assertTrue(phoneNumberUtils.findUniqueContact("+1 123 456 7890", listOf(alice, bob)) === alice)
+    }
+
+    @Test
+    fun findUniqueContact_ambiguousExactMatch_returnsNull() {
+        val alice = contact("alice", "+1 123 456 7890")
+        val shared = contact("shared", "+1 123 456 7890")
+        assertTrue(phoneNumberUtils.findUniqueContact("+1 123 456 7890", listOf(alice, shared)) == null)
+    }
+
+    @Test
+    fun findUniqueContact_uniqueFormattedMatch_returnsContact() {
+        val alice = contact("alice", "+1 123 456 7890")
+        assertTrue(phoneNumberUtils.findUniqueContact("123 456 7890", listOf(alice)) === alice)
+    }
+
+    @Test
+    fun findUniqueContact_ambiguousFormattedMatch_returnsNull() {
+        val alice = contact("alice", "123 456 7890")
+        val shared = contact("shared", "1 123 456 7890")
+        assertTrue(phoneNumberUtils.findUniqueContact("+1 123 456 7890", listOf(alice, shared)) == null)
+    }
+
+    @Test
+    fun findUniqueContact_blankAddress_returnsNull() {
+        val alice = contact("alice", "+1 123 456 7890")
+        assertTrue(phoneNumberUtils.findUniqueContact(" ", listOf(alice)) == null)
+    }
+
+    @Test
+    fun contactMatcher_reusesIndexForMultipleRecipientAddresses() {
+        val alice = contact("alice", "+1 123 456 7890")
+        val bob = contact("bob", "+1 222 333 4444")
+        val matcher = phoneNumberUtils.contactMatcher(listOf(alice, bob))
+
+        assertTrue(matcher.findUniqueContact("123 456 7890") === alice)
+        assertTrue(matcher.findUniqueContact("+1 222 333 4444") === bob)
+    }
+
+    private fun contact(lookupKey: String, vararg addresses: String) =
+        Contact(lookupKey = lookupKey, name = lookupKey).apply {
+            addresses.forEach { address -> numbers.add(PhoneNumber(address = address)) }
+        }
 
 }

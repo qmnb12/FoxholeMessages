@@ -96,35 +96,34 @@ class ConversationRepositoryImpl @Inject constructor(
 
     override fun getTopConversations() =
         Realm.getDefaultInstance().use { realm ->
-            realm.where(Conversation::class.java)
+            val cutoff = System.currentTimeMillis() - TimeUnit.DAYS.toMillis(7)
+            val conversations = realm.where(Conversation::class.java)
                 .notEqualTo("id", 0L)
                 .isNotNull("lastMessage")
                 .beginGroup()
                 .equalTo("pinned", true)
                 .or()
-                .greaterThan(
-                    "lastMessage.date",
-                    System.currentTimeMillis() - TimeUnit.DAYS.toMillis(7)
-                )
+                .greaterThan("lastMessage.date", cutoff)
                 .endGroup()
                 .equalTo("archived", false)
                 .equalTo("blocked", false)
                 .isNotEmpty("recipients")
                 .findAll()
                 .let(realm::copyFromRealm)
-                .sortedWith(compareByDescending<Conversation> {
-                        conversation -> conversation.pinned
-                }
-                    .thenByDescending { conversation ->
-                        realm.where(Message::class.java)
-                            .equalTo("threadId", conversation.id)
-                            .greaterThan(
-                                "date",
-                                System.currentTimeMillis() - TimeUnit.DAYS.toMillis(7)
-                            )
-                            .count()
-                    }
-                )
+
+            // Avoid a Realm count query from inside the sort comparator. A comparator can run
+            // many times per item, turning this into hundreds of database queries for a long list.
+            val recentMessageCounts = realm.where(Message::class.java)
+                .isNull("deletedAt")
+                .greaterThan("date", cutoff)
+                .findAll()
+                .groupingBy { message -> message.threadId }
+                .eachCount()
+
+            conversations.sortedWith(
+                compareByDescending<Conversation> { conversation -> conversation.pinned }
+                    .thenByDescending { conversation -> recentMessageCounts[conversation.id] ?: 0 }
+            )
         }
 
     override fun setConversationName(id: Long, name: String) =
@@ -141,39 +140,42 @@ class ConversationRepositoryImpl @Inject constructor(
 
     override fun searchConversations(query: CharSequence): List<SearchResult> {
         val realm = Realm.getDefaultInstance()
-
         val searchQuery = query.toString()
-        val conversations = realm.copyFromRealm(realm
-            .where(Conversation::class.java)
-            .notEqualTo("id", 0L)
-            .isNotNull("lastMessage")
-            .equalTo("blocked", false)
-            .isNotEmpty("recipients")
-            .sort("pinned", Sort.DESCENDING, "lastMessage.date", Sort.DESCENDING)
-            .findAll())
 
-        val messagesByConversation = realm.copyFromRealm(realm
-            .where(Message::class.java)
-            .beginGroup()
-            .contains("body", searchQuery, Case.INSENSITIVE)
-            .or()
-            .contains("parts.text", searchQuery, Case.INSENSITIVE)
-            .endGroup()
-            .findAll())
-            .groupBy { message -> message.threadId }
-            .filter { (threadId, _) -> conversations.firstOrNull { it.id == threadId } != null }
-            .map { (threadId, messages) -> Pair(conversations.first { it.id == threadId }, messages.size) }
-            .map { (conversation, messages) -> SearchResult(searchQuery, conversation, messages) }
-            .sortedByDescending { result -> result.messages }
-            .toList()
+        return try {
+            val conversations = realm.copyFromRealm(realm
+                .where(Conversation::class.java)
+                .notEqualTo("id", 0L)
+                .isNotNull("lastMessage")
+                .equalTo("blocked", false)
+                .isNotEmpty("recipients")
+                .sort("pinned", Sort.DESCENDING, "lastMessage.date", Sort.DESCENDING)
+                .findAll())
+            val conversationsById = conversations.associateBy { conversation -> conversation.id }
 
-        realm.close()
+            val messagesByConversation = realm.copyFromRealm(realm
+                .where(Message::class.java)
+                .isNull("deletedAt")
+                .beginGroup()
+                .contains("body", searchQuery, Case.INSENSITIVE)
+                .or()
+                .contains("parts.text", searchQuery, Case.INSENSITIVE)
+                .endGroup()
+                .findAll())
+                .groupBy { message -> message.threadId }
+                .mapNotNull { (threadId, messages) ->
+                    conversationsById[threadId]?.let { conversation ->
+                        SearchResult(searchQuery, conversation, messages.size)
+                    }
+                }
+                .sortedByDescending { result -> result.messages }
 
-        return conversations
-            .filter { conversation -> conversationFilter.filter(conversation, searchQuery) }
-            .map {
-                    conversation -> SearchResult(searchQuery, conversation, 0)
-            } + messagesByConversation
+            conversations
+                .filter { conversation -> conversationFilter.filter(conversation, searchQuery) }
+                .map { conversation -> SearchResult(searchQuery, conversation, 0) } + messagesByConversation
+        } finally {
+            realm.close()
+        }
     }
 
     override fun getBlockedConversations(): RealmResults<Conversation> =
@@ -223,10 +225,12 @@ class ConversationRepositoryImpl @Inject constructor(
                 }
         }
 
-    override fun getUnseenIds(archived: Boolean) =
-        ArrayList<Long>().apply {
-            Realm.getDefaultInstance()
-                .where(Conversation::class.java)
+    // These APIs return an immediate snapshot, not a live RealmResults. Using findAllAsync()
+    // here can return an empty, not-yet-loaded result when iterated immediately, silently
+    // dropping notification IDs. Use a synchronous query and close its Realm afterward.
+    override fun getUnseenIds(archived: Boolean): List<Long> =
+        Realm.getDefaultInstance().use { realm ->
+            realm.where(Conversation::class.java)
                 .notEqualTo("id", 0L)
                 .equalTo("archived", archived)
                 .equalTo("blocked", false)
@@ -235,15 +239,13 @@ class ConversationRepositoryImpl @Inject constructor(
                     arrayOf("lastMessage.date"),
                     arrayOf(Sort.DESCENDING)
                 )
-                .findAllAsync()
-                .forEach { conversation -> add(conversation.id) }
+                .findAll()
+                .map { conversation -> conversation.id }
         }
 
-
-    override fun getUnreadIds(archived: Boolean) =
-        ArrayList<Long>().apply {
-            Realm.getDefaultInstance()
-                .where(Conversation::class.java)
+    override fun getUnreadIds(archived: Boolean): List<Long> =
+        Realm.getDefaultInstance().use { realm ->
+            realm.where(Conversation::class.java)
                 .notEqualTo("id", 0L)
                 .equalTo("archived", archived)
                 .equalTo("blocked", false)
@@ -252,8 +254,8 @@ class ConversationRepositoryImpl @Inject constructor(
                     arrayOf("lastMessage.date"),
                     arrayOf(Sort.DESCENDING)
                 )
-                .findAllAsync()
-                .forEach { conversation -> add(conversation.id) }
+                .findAll()
+                .map { conversation -> conversation.id }
         }
 
     override fun getConversationAndLastSenderContactName(threadId: Long): Pair<Conversation?, String?>? =
@@ -263,9 +265,11 @@ class ConversationRepositoryImpl @Inject constructor(
             .equalTo("id", threadId)
             .findFirst()
             ?.let { conversation ->
-                val conversationLastSmsSender: String? = conversation.recipients.find { recipient ->
-                    phoneNumberUtils.compare(recipient.address, conversation.lastMessage!!.address)
-                }?.contact?.name
+                val conversationLastSmsSender: String? = conversation.lastMessage?.let { lastMessage ->
+                    conversation.recipients.find { recipient ->
+                        phoneNumberUtils.compare(recipient.address, lastMessage.address)
+                    }?.contact?.name
+                }
 
                 Pair(conversation, conversationLastSmsSender)
             }
@@ -367,26 +371,31 @@ class ConversationRepositoryImpl @Inject constructor(
         Realm.getDefaultInstance().use { realm ->
             realm.refresh()
 
-            realm.where(Conversation::class.java)
-                .anyOf("id", threadIds.toLongArray())
-                .findAll()
-                ?.map { conversation ->
-                    Pair(
-                        conversation,
-                        realm.where(Message::class.java)
-                            .equalTo("threadId", conversation.id)
-                            .isNull("deletedAt")
-                            .sort("date", Sort.DESCENDING)
-                            .findFirst()
-                    )
-                }
-                ?.let { conversationAndMessages ->
-                    realm.executeTransaction {
-                        conversationAndMessages.forEach { (conversation, message) ->
-                            conversation.lastMessage = message
+            if (threadIds.isNotEmpty()) {
+                val conversations = realm.where(Conversation::class.java)
+                    .anyOf("id", threadIds.toLongArray())
+                    .findAll()
+
+                // Fetch all candidate messages in one query and keep the first (newest) message
+                // per thread, instead of issuing one query for every changed conversation.
+                val latestMessageByThreadId = HashMap<Long, Message>()
+                realm.where(Message::class.java)
+                    .anyOf("threadId", threadIds.toLongArray())
+                    .isNull("deletedAt")
+                    .sort("date", Sort.DESCENDING)
+                    .findAll()
+                    .forEach { message ->
+                        if (!latestMessageByThreadId.containsKey(message.threadId)) {
+                            latestMessageByThreadId[message.threadId] = message
                         }
                     }
+
+                realm.executeTransaction {
+                    conversations.forEach { conversation ->
+                        conversation.lastMessage = latestMessageByThreadId[conversation.id]
+                    }
                 }
+            }
 
             Unit
         }
@@ -548,11 +557,12 @@ class ConversationRepositoryImpl @Inject constructor(
     private fun createConversationFromCp(threadId: Long, sendAsGroup: Boolean) =
         tryOrNull(true) {
             cursorToConversation.getConversationsCursor()
-                ?.map(cursorToConversation::map)
+                ?.use { cursor -> cursor.map(cursorToConversation::map) }
                 ?.firstOrNull { conversation -> conversation.id == threadId }
                 ?.also { conversation ->
                     Realm.getDefaultInstance().use { realm ->
                         val realmContacts = realm.where(Contact::class.java).findAll()
+                        val contactMatcher = phoneNumberUtils.contactMatcher(realmContacts)
 
                         // match recipients from provider to recipients in realm
                         val matchedRecipients = conversation.recipients
@@ -565,12 +575,8 @@ class ConversationRepositoryImpl @Inject constructor(
                             .flatten()
                             .map { recipient ->
                                 recipient.apply {
-                                    contact = realmContacts.firstOrNull { realmContact ->
-                                        realmContact.numbers.any {
-                                            phoneNumberUtils.compare(it.address, address)
-                                        }
-                                    }
-                                    ?.let { realm.copyFromRealm(it) }
+                                    contact = contactMatcher.findUniqueContact(address)
+                                        ?.let { realm.copyFromRealm(it) }
                                 }
                             }
 
@@ -584,6 +590,7 @@ class ConversationRepositoryImpl @Inject constructor(
 
                             lastMessage = realm.where(Message::class.java)
                                 .equalTo("threadId", threadId)
+                                .isNull("deletedAt")
                                 .sort("date", Sort.DESCENDING)
                                 .findFirst()
                         }
@@ -603,14 +610,11 @@ class ConversationRepositoryImpl @Inject constructor(
     private fun createEmptyConversation(threadId: Long, addresses: Collection<String>, sendAsGroup: Boolean): Conversation {
         Realm.getDefaultInstance().use { realm ->
             val realmContacts = realm.where(Contact::class.java).findAll()
+            val contactMatcher = phoneNumberUtils.contactMatcher(realmContacts)
             val matchedRecipients = addresses.map { address ->
                 Recipient().apply {
                     this.address = address
-                    contact = realmContacts.firstOrNull { realmContact ->
-                            realmContact.numbers.any {
-                                phoneNumberUtils.compare(it.address, address)
-                            }
-                        }
+                    contact = contactMatcher.findUniqueContact(address)
                         ?.let { realm.copyFromRealm(it) }
                 }
             }

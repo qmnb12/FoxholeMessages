@@ -84,12 +84,18 @@ class StarredMessagesAdapter @Inject constructor(
     private inner class ContactCache : HashMap<String, Contact?>() {
 
         override fun get(key: String): Contact? {
-            if (super.get(key)?.isValid != true) {
-                set(key, contacts.firstOrNull { contact ->
-                    contact.numbers.any { phoneNumberUtils.compare(it.address, key) }
-                })
+            if (key.isBlank()) return null
+
+            val cached = super.get(key)
+            if (containsKey(key) && (cached == null || cached.isValid)) {
+                return cached
             }
-            return super.get(key)?.takeIf { it.isValid }
+
+            val match = contacts.firstOrNull { contact ->
+                contact.numbers.any { phoneNumberUtils.compare(it.address, key) }
+            }
+            set(key, match)
+            return match?.takeIf { it.isValid }
         }
     }
 }

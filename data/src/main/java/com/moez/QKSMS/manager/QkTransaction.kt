@@ -332,15 +332,15 @@ object QkTransaction {
         }
 
         Timber.v("send sms message uri $messageUri")
-        try {
+        return try {
             smsManager.sendMultipartTextMessage(
                 address, null, parts, sPI, dPI.ifEmpty { null }
             )
+            true
         } catch (e: Exception) {
             Timber.e(e, "send sms exception")
+            false
         }
-
-        return true
     }
 
     private fun createMmsMessage(

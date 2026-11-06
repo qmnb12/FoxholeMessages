@@ -123,11 +123,7 @@ class ReceiveMmsWorker(appContext: Context, workerParams: WorkerParameters)
         try {
             // read file into a bytearray
             val mmsData = FileInputStream(downloadFile).use { inputStream ->
-                val fileLength = downloadFile.length().toInt()
-                ByteArray(fileLength).let { bytes ->
-                    inputStream.read(bytes, 0, fileLength)
-                    bytes
-                }
+                inputStream.readBytes()
             }
 
             Timber.v("response buffered length: ${mmsData.size}")
@@ -153,8 +149,14 @@ class ReceiveMmsWorker(appContext: Context, workerParams: WorkerParameters)
 
                 DownloadManager.finishDownload(locationUrl)
 
-                // if message was persisted ok
+                // The MMSC download is complete and the message is already persisted in the
+                // system provider. Acknowledge it before app-side sync/filter/notification work,
+                // because any of those paths can return early; otherwise the carrier may retry
+                // and deliver the same MMS again.
                 if (messageUri != null) {
+                    sendAcknowledgeInd(applicationContext, subscriptionId, notificationInd)
+                    sendNotifyRespInd(applicationContext, subscriptionId, notificationInd)
+
                     // Sync the message
                     val message = syncRepo.syncMessage(messageUri)
                         ?: return Result.failure(inputData)
@@ -224,11 +226,7 @@ class ReceiveMmsWorker(appContext: Context, workerParams: WorkerParameters)
                             return Result.success(inputData)
                         }
 
-                        // unarchive conversation if necessary
-                        if (conversation.archived)
-                            conversationRepo.markUnarchived(listOf(conversation.id))
-
-                        // unarchive conversation if necessary
+                        // Unarchive the conversation if necessary.
                         if (conversation.archived) {
                             Timber.v("conversation unarchived")
                             conversationRepo.markUnarchived(listOf(conversation.id))
@@ -248,11 +246,6 @@ class ReceiveMmsWorker(appContext: Context, workerParams: WorkerParameters)
                         updateBadge.execute(Unit)
                     }
 
-                    // send ack to mmsc
-                    sendAcknowledgeInd(applicationContext, subscriptionId, notificationInd)
-
-                    // send notify ind to mmsc
-                    sendNotifyRespInd(applicationContext, subscriptionId, notificationInd)
                 }
             }
             else Timber.e("empty mms data")

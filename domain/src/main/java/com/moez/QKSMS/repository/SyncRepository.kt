@@ -20,6 +20,7 @@ package dev.octoshrimpy.quik.repository
 
 import android.net.Uri
 import dev.octoshrimpy.quik.model.Message
+import io.reactivex.Completable
 import io.reactivex.Observable
 
 interface SyncRepository {
@@ -33,6 +34,9 @@ interface SyncRepository {
     val syncProgress: Observable<SyncProgress>
 
     fun syncMessages()
+
+    /** Requests a full sync after any currently running sync and completes when it finishes. */
+    fun syncMessagesAndAwait(): Completable
 
     fun syncMessage(uri: Uri, messageId: Long = 0): Message?
 
