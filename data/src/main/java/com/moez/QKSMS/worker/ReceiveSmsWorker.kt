@@ -27,6 +27,7 @@ import dev.octoshrimpy.quik.classifier.Category
 import dev.octoshrimpy.quik.classifier.MessageCategorizer
 import dev.octoshrimpy.quik.classifier.OtpDetector
 import dev.octoshrimpy.quik.interactor.UpdateBadge
+import dev.octoshrimpy.quik.manager.ActiveConversationManager
 import dev.octoshrimpy.quik.manager.NotificationManager
 import dev.octoshrimpy.quik.manager.ShortcutManager
 import dev.octoshrimpy.quik.repository.ContactRepository
@@ -43,6 +44,7 @@ class ReceiveSmsWorker(appContext: Context, workerParams: WorkerParameters)
         const val INPUT_DATA_KEY_MESSAGE_ID = "messageId"
     }
 
+    @Inject lateinit var activeConversationManager: ActiveConversationManager
     @Inject lateinit var conversationRepo: ConversationRepository
     @Inject lateinit var blockingClient: BlockingClient
     @Inject lateinit var prefs: Preferences
@@ -65,6 +67,11 @@ class ReceiveSmsWorker(appContext: Context, workerParams: WorkerParameters)
         }
 
         val message = messageRepo.getMessage(messageId) ?: return Result.failure(inputData)
+
+        if (activeConversationManager.getActiveConversation() == message.threadId) {
+            Timber.v("conversation is open; marking received SMS as read")
+            messageRepo.markRead(listOf(message.threadId))
+        }
 
         val category = try {
             messageCategorizer.categorize(message.address, message.getText())

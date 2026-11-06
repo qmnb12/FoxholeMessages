@@ -1,5 +1,14 @@
 [
   {
+    "versionCode": 2269,
+    "versionName": "2.4.8",
+    "fixed": [
+      "Incoming SMS received while its conversation is open is immediately marked read and seen in both Realm and Android's SMS provider",
+      "Read and seen flags are updated on individual SMS and MMS rows for better provider compatibility",
+      "Mark unread now keeps every message in the conversation consistent between Realm and the Android provider"
+    ]
+  },
+  {
     "versionCode": 2268,
     "versionName": "2.4.7",
     "fixed": [

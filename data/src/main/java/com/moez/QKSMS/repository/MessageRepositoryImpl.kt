@@ -357,60 +357,75 @@ open class MessageRepositoryImpl @Inject constructor(
             .sort("date")
             .findAll()
 
-    // marks all messages in threads as read and/or seen in the native provider
+    // Apply read/seen flags directly to individual SMS and MMS rows. Some OEM
+    // providers do not reliably propagate a conversation-URI READ update to every message.
     private fun telephonyMarkSeenRead(
         seen: Boolean?,
         read: Boolean?,
         threadIds: Collection<Long>,
     ): Int {
         if (((seen == null) && (read == null)) || threadIds.isEmpty())
-            return -1
+            return 0
 
         var countUpdated = 0
 
-        // 'read' can be modified at the conversation level which updates all messages
-        read?.let {
-            tryOrNull(true) {
-                // chunked so where clause doesn't get too long if there are many threads
-                threadIds.forEach {
-                    countUpdated += context.contentResolver.update(
-                        ContentUris.withAppendedId(
-                            Telephony.MmsSms.CONTENT_CONVERSATIONS_URI,
-                            it
-                        ),
-                        contentValuesOf(Sms.READ to read),
-                        "${Sms.READ} = ${if (read) 0 else 1}",
+        threadIds.chunked(TELEPHONY_UPDATE_CHUNK_SIZE).forEach { chunk ->
+            read?.let { value ->
+                val smsSelection = TelephonyMessageSelection.forThreadFlag(
+                    Sms.READ, Sms.THREAD_ID, value, chunk
+                )
+                val mmsSelection = TelephonyMessageSelection.forThreadFlag(
+                    Mms.READ, Mms.THREAD_ID, value, chunk
+                )
+
+                tryOrNull(true) {
+                    context.contentResolver.update(
+                        Sms.CONTENT_URI,
+                        contentValuesOf(Sms.READ to value),
+                        smsSelection,
                         null
                     )
-                }
+                }?.let { countUpdated += it }
+
+                tryOrNull(true) {
+                    context.contentResolver.update(
+                        Mms.CONTENT_URI,
+                        contentValuesOf(Mms.READ to value),
+                        mmsSelection,
+                        null
+                    )
+                }?.let { countUpdated += it }
+            }
+
+            seen?.let { value ->
+                val smsSelection = TelephonyMessageSelection.forThreadFlag(
+                    Sms.SEEN, Sms.THREAD_ID, value, chunk
+                )
+                val mmsSelection = TelephonyMessageSelection.forThreadFlag(
+                    Mms.SEEN, Mms.THREAD_ID, value, chunk
+                )
+
+                tryOrNull(true) {
+                    context.contentResolver.update(
+                        Sms.CONTENT_URI,
+                        contentValuesOf(Sms.SEEN to value),
+                        smsSelection,
+                        null
+                    )
+                }?.let { countUpdated += it }
+
+                tryOrNull(true) {
+                    context.contentResolver.update(
+                        Mms.CONTENT_URI,
+                        contentValuesOf(Mms.SEEN to value),
+                        mmsSelection,
+                        null
+                    )
+                }?.let { countUpdated += it }
             }
         }
 
-        seen?.let {
-            // 'seen' has to be modified at the messages level
-            threadIds.chunked(TELEPHONY_UPDATE_CHUNK_SIZE).forEach {
-                // chunked for smaller where clause size
-                val values = contentValuesOf(Sms.SEEN to seen)
-                val whereClause = "${Sms.SEEN} = ${if (seen) 0 else 1} " +
-                        "and ${Sms.THREAD_ID} in (${it.joinToString(",")})"
-
-                // sms messages
-                tryOrNull(true) {
-                    countUpdated += context.contentResolver.update(
-                        Sms.CONTENT_URI, values, whereClause, null
-                    )
-                }
-
-                // mms messages
-                tryOrNull(true) {
-                    countUpdated += context.contentResolver.update(
-                        Mms.CONTENT_URI, values, whereClause, null
-                    )
-                }
-            }
-        }
-
-        return countUpdated  // a mix of convo and message updates, so not overly useful. meh
+        return countUpdated
     }
 
     override fun markAllSeen() =
@@ -475,13 +490,16 @@ open class MessageRepositoryImpl @Inject constructor(
         threadIds.takeIf { it.isNotEmpty() }
             ?.let {
                 Realm.getDefaultInstance()?.use { realm ->
-                    val conversations = realm.where(Conversation::class.java)
-                        .anyOf("id", threadIds.toLongArray())
-                        .equalTo("lastMessage.read", true)
+                    val messages = realm.where(Message::class.java)
+                        .anyOf("threadId", threadIds.toLongArray())
+                        .equalTo("read", true)
                         .findAll()
 
+                    // The provider update below marks the entire conversation unread.
+                    // Keep every Realm message in the same state so counts and the next
+                    // provider sync cannot disagree.
                     realm.executeTransaction {
-                        conversations.forEach { it.lastMessage?.read = false }
+                        messages.forEach { it.read = false }
                     }
                 }.run {
                     telephonyMarkSeenRead(null, false, threadIds)
@@ -828,11 +846,14 @@ open class MessageRepositoryImpl @Inject constructor(
         val threadId = TelephonyCompat.getOrCreateThreadId(context, address)
 
         // insert the message to the native content provider
+        val isConversationActive = activeConversationManager.getActiveConversation() == threadId
         val values = contentValuesOf(
             Sms.ADDRESS to address,
             Sms.BODY to body,
             Sms.DATE_SENT to sentTime,
-            Sms.THREAD_ID to threadId
+            Sms.THREAD_ID to threadId,
+            Sms.READ to isConversationActive,
+            Sms.SEEN to isConversationActive
         )
 
         if (prefs.canUseSubId.get())
@@ -857,7 +878,8 @@ open class MessageRepositoryImpl @Inject constructor(
             contentId = providerContentId
             boxId = Sms.MESSAGE_TYPE_INBOX
             type = TYPE_SMS
-            read = (activeConversationManager.getActiveConversation() == threadId)
+            read = isConversationActive
+            seen = isConversationActive
         }
 
         Realm.getDefaultInstance().use { realm ->
