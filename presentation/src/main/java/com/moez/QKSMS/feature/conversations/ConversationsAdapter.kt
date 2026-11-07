@@ -37,6 +37,7 @@ import dev.octoshrimpy.quik.databinding.ConversationListItemBinding
 import dev.octoshrimpy.quik.model.Conversation
 import dev.octoshrimpy.quik.repository.MessageRepository
 import dev.octoshrimpy.quik.util.PhoneNumberUtils
+import io.reactivex.android.schedulers.AndroidSchedulers
 import io.reactivex.disposables.CompositeDisposable
 import javax.inject.Inject
 
@@ -62,7 +63,14 @@ class ConversationsAdapter @Inject constructor(
         setHasStableIds(true)
 
         // Rebind immediately when a thread enters/leaves the optimistic read state.
-        disposables.add(messageRepo.readStateChanges.subscribe { notifyDataSetChanged() })
+        disposables.add(
+            messageRepo.readStateChanges
+                .observeOn(AndroidSchedulers.mainThread())
+                .subscribe(
+                    { notifyDataSetChanged() },
+                    { error -> android.util.Log.e("ConversationsAdapter", "Failed to refresh read state", error) }
+                )
+        )
     }
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): QkBindingViewHolder<ConversationListItemBinding> {
