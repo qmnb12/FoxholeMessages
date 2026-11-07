@@ -41,34 +41,42 @@ class SmsReceivedReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         AndroidInjection.inject(this, context)
 
-        Sms.Intents.getMessagesFromIntent(intent)?.let { messages ->
-            val pendingResult = goAsync()
-            // reduce list of messages to single message and save in db
-            Single.just(messages)
-                .observeOn(Schedulers.io())
-                .map {
-                    Timber.v("onReceive() new sms")  // here so runs on io thread
+        val messages = Sms.Intents.getMessagesFromIntent(intent)
+            ?.takeIf { it.isNotEmpty() }
+            ?: run {
+                Timber.w("Ignoring SMS broadcast with no message parts")
+                return
+            }
 
-                    messageRepo.insertReceivedSms(
-                        intent.extras?.getInt("subscription", -1) ?: -1,
-                        messages[0].displayOriginatingAddress,
-                        messages.mapNotNull { it.displayMessageBody }.reduce { body, new -> body + new },
-                        messages[0].timestampMillis
-                    ).id
-                }
-                .subscribe({ messageId ->
+        val pendingResult = goAsync()
+        Single.just(messages)
+            .observeOn(Schedulers.io())
+            .map { parts ->
+                Timber.v("onReceive() new sms")
+                messageRepo.insertReceivedSms(
+                    intent.extras?.getInt("subscription", -1) ?: -1,
+                    parts[0].displayOriginatingAddress,
+                    parts.joinToString(separator = "") { it.displayMessageBody.orEmpty() },
+                    parts[0].timestampMillis
+                ).id
+            }
+            .subscribe({ messageId ->
+                try {
                     WorkManager.getInstance(context).enqueue(
                         OneTimeWorkRequestBuilder<ReceiveSmsWorker>()
                             .setInputData(workDataOf(INPUT_DATA_KEY_MESSAGE_ID to messageId))
                             .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
                             .build()
                     )
+                } catch (error: Exception) {
+                    Timber.e(error, "unable to enqueue SMS receive worker for messageId=$messageId")
+                } finally {
                     pendingResult.finish()
-                }, { error ->
-                    Timber.e(error, "error receiving new sms")
-                    pendingResult.finish()
-                })
-        }
+                }
+            }, { error ->
+                Timber.e(error, "error receiving new sms")
+                pendingResult.finish()
+            })
     }
 
 }
