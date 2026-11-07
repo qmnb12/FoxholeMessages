@@ -43,6 +43,9 @@ interface MessageRepository {
     /** Emits thread IDs immediately after local read/unread flags are committed. */
     val readStateChanges: Observable<Set<Long>>
 
+    /** True while a thread is being marked read, even if a long Realm sync delays the commit. */
+    fun isReadPending(threadId: Long): Boolean
+
     fun getMessages(threadId: Long, query: String = ""): RealmResults<Message>
 
     fun getMessagesSync(threadId: Long, query: String = ""): RealmResults<Message>

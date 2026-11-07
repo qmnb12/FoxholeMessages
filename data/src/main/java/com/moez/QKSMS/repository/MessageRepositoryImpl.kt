@@ -101,6 +101,12 @@ open class MessageRepositoryImpl @Inject constructor(
     private val readStateChangesSubject: Subject<Set<Long>> = PublishSubject.create<Set<Long>>().toSerialized()
     override val readStateChanges: Observable<Set<Long>> = readStateChangesSubject.hide()
 
+    // Full provider syncs can hold Realm's write lock for several seconds. Keep the Inbox's
+    // read presentation responsive while markRead waits for that transaction to finish.
+    private val pendingReadThreadIds = java.util.concurrent.ConcurrentHashMap.newKeySet<Long>()
+
+    override fun isReadPending(threadId: Long): Boolean = threadId in pendingReadThreadIds
+
     // All provider read/seen updates run in order. A slow OEM Telephony provider must not
     // delay the local Realm/UI state or reorder a later mark-unread behind an earlier mark-read.
     private val telephonyReadStateExecutor = Executors.newSingleThreadExecutor { runnable ->
@@ -505,32 +511,41 @@ open class MessageRepositoryImpl @Inject constructor(
         val ids = threadIds.distinct()
         if (ids.isEmpty()) return 0
 
-        val updatedCount = Realm.getDefaultInstance().use { realm ->
-            val messages = realm.where(Message::class.java)
-                .anyOf("threadId", ids.toLongArray())
-                .beginGroup()
-                .equalTo("read", false)
-                .or()
-                .equalTo("seen", false)
-                .endGroup()
-                .findAll()
-            val count = messages.size
-            if (count > 0) {
-                realm.executeTransaction {
-                    messages.forEach { message ->
-                        message.seen = true
-                        message.read = true
+        // Publish the pending state before touching Realm. A full SMS-provider rebuild may own
+        // Realm's write lock; the conversation list should not keep showing unread during that wait.
+        pendingReadThreadIds.addAll(ids)
+        readStateChangesSubject.onNext(ids.toSet())
+
+        try {
+            val updatedCount = Realm.getDefaultInstance().use { realm ->
+                val messages = realm.where(Message::class.java)
+                    .anyOf("threadId", ids.toLongArray())
+                    .beginGroup()
+                    .equalTo("read", false)
+                    .or()
+                    .equalTo("seen", false)
+                    .endGroup()
+                    .findAll()
+                val count = messages.size
+                if (count > 0) {
+                    realm.executeTransaction {
+                        messages.forEach { message ->
+                            message.seen = true
+                            message.read = true
+                        }
                     }
                 }
+                count
             }
-            count
-        }
 
-        // Notify the Inbox as soon as the local commit is visible. The UI must not rely on
-        // Realm noticing a change through Conversation.lastMessage's linked Message object.
-        readStateChangesSubject.onNext(ids.toSet())
-        enqueueTelephonyReadStateUpdate(seen = true, read = true, threadIds = ids)
-        return updatedCount
+            enqueueTelephonyReadStateUpdate(seen = true, read = true, threadIds = ids)
+            return updatedCount
+        } finally {
+            // The real Realm flags are now committed (or the operation failed), so the adapter
+            // can return to its database-backed state and refresh the row one final time.
+            pendingReadThreadIds.removeAll(ids.toSet())
+            readStateChangesSubject.onNext(ids.toSet())
+        }
     }
 
     override fun markUnread(threadIds: Collection<Long>): Int {
