@@ -48,9 +48,11 @@ class SmsProviderChangedReceiver : BroadcastReceiver() {
 
         // Sync the message to our realm
         val pendingResult = goAsync()
-        syncMessage.execute(SyncMessage.Params(uri)) {
-            pendingResult.finish()
-        }
+        syncMessage.execute(
+            SyncMessage.Params(uri),
+            onComplete = { pendingResult.finish() },
+            onError = { pendingResult.finish() }
+        )
     }
 
 }

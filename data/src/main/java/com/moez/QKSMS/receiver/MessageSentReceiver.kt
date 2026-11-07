@@ -65,13 +65,17 @@ class MessageSentReceiver : BroadcastReceiver() {
 
                 when (pendingResult.resultCode) {
                     Activity.RESULT_OK ->
-                        markSent.execute(messageId) { pendingResult.finish() }
+                        markSent.execute(
+                            messageId,
+                            onComplete = { pendingResult.finish() },
+                            onError = { pendingResult.finish() }
+                        )
 
                     else -> markFailed.execute(
-                        MarkFailed.Params(messageId, pendingResult.resultCode)
-                    ) {
-                        pendingResult.finish()
-                    }
+                        MarkFailed.Params(messageId, pendingResult.resultCode),
+                        onComplete = { pendingResult.finish() },
+                        onError = { pendingResult.finish() }
+                    )
                 }
             } ?: let { Timber.e("couldn't get message id") }
     }

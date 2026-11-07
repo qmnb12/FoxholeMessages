@@ -32,12 +32,23 @@ abstract class Interactor<in Params> : Disposable {
 
     abstract fun buildObservable(params: Params): Flowable<*>
 
-    fun execute(params: Params, onComplete: () -> Unit = {}) {
+    fun execute(
+        params: Params,
+        onComplete: () -> Unit = {},
+        onError: (Throwable) -> Unit = {}
+    ) {
         disposables += buildObservable(params)
                 .subscribeOn(Schedulers.io())
                 .observeOn(AndroidSchedulers.mainThread())
                 .doOnComplete(onComplete)
-                .subscribe({}, Timber::w)
+                .subscribe({}, { error ->
+                    Timber.w(error)
+                    try {
+                        onError(error)
+                    } catch (callbackError: Exception) {
+                        Timber.e(callbackError, "Interactor error callback failed")
+                    }
+                })
     }
 
     override fun dispose() {

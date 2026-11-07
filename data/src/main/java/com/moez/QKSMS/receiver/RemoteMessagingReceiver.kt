@@ -58,7 +58,11 @@ class RemoteMessagingReceiver : BroadcastReceiver() {
             if (pending == 0) pendingResult.finish()
         }
 
-        markRead.execute(listOf(threadId), onOneComplete)
+        markRead.execute(
+            listOf(threadId),
+            onComplete = onOneComplete,
+            onError = { onOneComplete() }
+        )
 
         sendNewMessage.execute(
             SendNewMessage.Params(
@@ -70,7 +74,8 @@ class RemoteMessagingReceiver : BroadcastReceiver() {
                 remoteInput.getCharSequence("body").toString(),
                 conversation.sendAsGroup
             ),
-            onOneComplete
+            onComplete = onOneComplete,
+            onError = { onOneComplete() }
         )
     }
 }

@@ -49,13 +49,19 @@ class MessageDeliveredReceiver : BroadcastReceiver() {
 
                 when (pendingResult.resultCode) {
                     // TODO notify about delivery
-                    Activity.RESULT_OK -> markDelivered.execute(messageId) { pendingResult.finish() }
+                    Activity.RESULT_OK -> markDelivered.execute(
+                        messageId,
+                        onComplete = { pendingResult.finish() },
+                        onError = { pendingResult.finish() }
+                    )
 
                     // TODO notify about delivery failure
                     else ->
-                        markDeliveryFailed.execute(MarkDeliveryFailed.Params(messageId, resultCode)) {
-                            pendingResult.finish()
-                        }
+                        markDeliveryFailed.execute(
+                            MarkDeliveryFailed.Params(messageId, resultCode),
+                            onComplete = { pendingResult.finish() },
+                            onError = { pendingResult.finish() }
+                        )
                 }
             } ?: let { Timber.e("couldn't get message id") }
     }

@@ -44,7 +44,7 @@ class SpeakThreadsReceiver : BroadcastReceiver() {
             else -> listOf(threadId)
         }
 
-        speakThread.execute(threads) { pendingResult.finish() }
+        speakThread.execute(threads, onComplete = { pendingResult.finish() }, onError = { pendingResult.finish() })
     }
 
 }
