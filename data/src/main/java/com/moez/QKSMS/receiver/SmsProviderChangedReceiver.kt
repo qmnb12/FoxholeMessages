@@ -43,9 +43,12 @@ class SmsProviderChangedReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         AndroidInjection.inject(this, context)
 
+        // Ignore malformed provider-change broadcasts before acquiring an async result.
+        val uri = intent.data ?: return
+
         // Sync the message to our realm
         val pendingResult = goAsync()
-        syncMessage.execute(SyncMessage.Params(intent.data ?: return)) {
+        syncMessage.execute(SyncMessage.Params(uri)) {
             pendingResult.finish()
         }
     }

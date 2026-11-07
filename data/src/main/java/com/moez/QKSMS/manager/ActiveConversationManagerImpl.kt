@@ -24,7 +24,7 @@ import javax.inject.Singleton
 @Singleton
 class ActiveConversationManagerImpl @Inject constructor() : ActiveConversationManager {
 
-    private var threadId: Long? = null
+    @Volatile private var threadId: Long? = null
 
     override fun setActiveConversation(threadId: Long?) {
         this.threadId = threadId
