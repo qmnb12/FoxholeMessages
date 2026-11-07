@@ -60,6 +60,9 @@ class ConversationsAdapter @Inject constructor(
     init {
         // This is how we access the threadId for the swipe actions
         setHasStableIds(true)
+
+        // Rebind immediately when a thread enters/leaves the optimistic read state.
+        disposables.add(messageRepo.readStateChanges.subscribe { notifyDataSetChanged() })
     }
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): QkBindingViewHolder<ConversationListItemBinding> {
@@ -126,10 +129,12 @@ class ConversationsAdapter @Inject constructor(
             else -> conversation.snippet
         }
 
+        val unread = conversation.unread && !messageRepo.isReadPending(conversation.id)
+
         // RecyclerView reuses holders; explicitly restore style after a draft row is rebound.
         val snippetStyle = when {
             conversation.draft.isNotEmpty() -> Typeface.ITALIC
-            conversation.unread -> Typeface.BOLD
+            unread -> Typeface.BOLD
             else -> Typeface.NORMAL
         }
         binding.snippet.setTypeface(binding.snippet.typeface, snippetStyle)
@@ -143,7 +148,8 @@ class ConversationsAdapter @Inject constructor(
         // generic TextView.setTint() extension tints the foreground instead, which would be a
         // silent no-op here since this view has no foreground drawable set.
         binding.unread.backgroundTintList = ColorStateList.valueOf(theme)
-        if (conversation.unread) {
+        binding.unread.isVisible = unread
+        if (unread) {
             binding.unread.text = messageRepo.getUnreadCountForConversation(conversation.id).toString()
         }
     }
@@ -153,7 +159,8 @@ class ConversationsAdapter @Inject constructor(
     }
 
     override fun getItemViewType(position: Int): Int {
-        return if (getItem(position)?.unread == false) 0 else 1
+        val conversation = getItem(position) ?: return 0
+        return if (conversation.unread && !messageRepo.isReadPending(conversation.id)) 1 else 0
     }
 
     override fun onDetachedFromRecyclerView(recyclerView: RecyclerView) {
