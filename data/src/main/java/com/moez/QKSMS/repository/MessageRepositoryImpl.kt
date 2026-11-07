@@ -66,8 +66,11 @@ import dev.octoshrimpy.quik.util.VideoUtils
 import dev.octoshrimpy.quik.util.sha256
 import dev.octoshrimpy.quik.util.tryOrNull
 import io.reactivex.Flowable
+import io.reactivex.Observable
 import io.reactivex.subjects.BehaviorSubject
+import io.reactivex.subjects.PublishSubject
 import io.reactivex.subjects.Subject
+import java.util.concurrent.Executors
 import io.realm.Case
 import io.realm.Realm
 import io.realm.RealmList
@@ -94,6 +97,15 @@ open class MessageRepositoryImpl @Inject constructor(
 
     override val deduplicationProgress: Subject<MessageRepository.DeduplicationProgress> =
         BehaviorSubject.createDefault(MessageRepository.DeduplicationProgress.Idle)
+
+    private val readStateChangesSubject: Subject<Set<Long>> = PublishSubject.create<Set<Long>>().toSerialized()
+    override val readStateChanges: Observable<Set<Long>> = readStateChangesSubject.hide()
+
+    // All provider read/seen updates run in order. A slow OEM Telephony provider must not
+    // delay the local Realm/UI state or reorder a later mark-unread behind an earlier mark-read.
+    private val telephonyReadStateExecutor = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "TelephonyReadState").apply { isDaemon = true }
+    }
 
     companion object {
         const val TELEPHONY_UPDATE_CHUNK_SIZE = 200
@@ -428,84 +440,123 @@ open class MessageRepositoryImpl @Inject constructor(
         return countUpdated
     }
 
-    override fun markAllSeen() =
-        mutableSetOf<Long>().let { threadIds ->
-            Realm.getDefaultInstance().use { realm ->
-                realm.where(Message::class.java)
-                    .equalTo("seen", false)
-                    .findAll()
-                    .takeIf { it.isNotEmpty() }
-                    ?.let { messages ->
-                        realm.executeTransaction {
-                            messages.forEach {
-                                it.seen = true
-                                threadIds += it.threadId
-                            }
-                        }
-                    }
-            }.run {
-                telephonyMarkSeenRead(true, null, threadIds)
+    private fun enqueueTelephonyReadStateUpdate(
+        seen: Boolean?,
+        read: Boolean?,
+        threadIds: Collection<Long>
+    ) {
+        if (threadIds.isEmpty()) return
+
+        val ids = threadIds.distinct()
+        telephonyReadStateExecutor.execute {
+            try {
+                telephonyMarkSeenRead(seen, read, ids)
+            } catch (error: Exception) {
+                Timber.e(error, "Unable to synchronize Telephony read state for threads=$ids")
             }
         }
+    }
 
-    override fun markSeen(threadIds: Collection<Long>) =
-        Realm.getDefaultInstance().use { realm ->
-            realm.where(Message::class.java)
-                .anyOf("threadId", threadIds.toLongArray())
+    override fun markAllSeen(): Int {
+        val threadIds = mutableSetOf<Long>()
+        val updatedCount = Realm.getDefaultInstance().use { realm ->
+            val messages = realm.where(Message::class.java)
                 .equalTo("seen", false)
                 .findAll()
-                .let { messages ->
-                    realm.executeTransaction {
-                        messages.forEach { it.seen = true }
+            val count = messages.size
+            if (count > 0) {
+                realm.executeTransaction {
+                    messages.forEach { message ->
+                        message.seen = true
+                        threadIds += message.threadId
                     }
                 }
-        }.run {
-            telephonyMarkSeenRead(true, null, threadIds)
+            }
+            count
         }
 
-    override fun markRead(threadIds: Collection<Long>) =
-        threadIds.takeIf { it.isNotEmpty() }
-            ?.let {
-                Realm.getDefaultInstance()?.use { realm ->
-                    realm.where(Message::class.java)
-                        .anyOf("threadId", threadIds.toLongArray())
-                        .beginGroup()
-                        .equalTo("read", false)
-                        .or()
-                        .equalTo("seen", false)
-                        .endGroup()
-                        .findAll()
-                        .let { messages ->
-                            realm.executeTransaction {
-                                messages.forEach { it.seen = true; it.read = true }
-                            }
-                        }
-                }.run {
-                    telephonyMarkSeenRead(seen = true, read = true, threadIds = threadIds)
+        enqueueTelephonyReadStateUpdate(true, null, threadIds)
+        return updatedCount
+    }
+
+    override fun markSeen(threadIds: Collection<Long>): Int {
+        val ids = threadIds.distinct()
+        if (ids.isEmpty()) return 0
+
+        val updatedCount = Realm.getDefaultInstance().use { realm ->
+            val messages = realm.where(Message::class.java)
+                .anyOf("threadId", ids.toLongArray())
+                .equalTo("seen", false)
+                .findAll()
+            val count = messages.size
+            if (count > 0) {
+                realm.executeTransaction {
+                    messages.forEach { it.seen = true }
                 }
             }
-            ?: 0
+            count
+        }
 
-    override fun markUnread(threadIds: Collection<Long>) =
-        threadIds.takeIf { it.isNotEmpty() }
-            ?.let {
-                Realm.getDefaultInstance()?.use { realm ->
-                    val messages = realm.where(Message::class.java)
-                        .anyOf("threadId", threadIds.toLongArray())
-                        .equalTo("read", true)
-                        .findAll()
+        enqueueTelephonyReadStateUpdate(true, null, ids)
+        return updatedCount
+    }
 
-                    // The provider update below marks the entire conversation unread.
-                    // Keep every Realm message in the same state so counts and the next
-                    // provider sync cannot disagree.
-                    realm.executeTransaction {
-                        messages.forEach { it.read = false }
+    override fun markRead(threadIds: Collection<Long>): Int {
+        val ids = threadIds.distinct()
+        if (ids.isEmpty()) return 0
+
+        val updatedCount = Realm.getDefaultInstance().use { realm ->
+            val messages = realm.where(Message::class.java)
+                .anyOf("threadId", ids.toLongArray())
+                .beginGroup()
+                .equalTo("read", false)
+                .or()
+                .equalTo("seen", false)
+                .endGroup()
+                .findAll()
+            val count = messages.size
+            if (count > 0) {
+                realm.executeTransaction {
+                    messages.forEach { message ->
+                        message.seen = true
+                        message.read = true
                     }
-                }.run {
-                    telephonyMarkSeenRead(null, false, threadIds)
                 }
             }
-            ?: 0
+            count
+        }
+
+        // Notify the Inbox as soon as the local commit is visible. The UI must not rely on
+        // Realm noticing a change through Conversation.lastMessage's linked Message object.
+        readStateChangesSubject.onNext(ids.toSet())
+        enqueueTelephonyReadStateUpdate(seen = true, read = true, threadIds = ids)
+        return updatedCount
+    }
+
+    override fun markUnread(threadIds: Collection<Long>): Int {
+        val ids = threadIds.distinct()
+        if (ids.isEmpty()) return 0
+
+        val updatedCount = Realm.getDefaultInstance().use { realm ->
+            val messages = realm.where(Message::class.java)
+                .anyOf("threadId", ids.toLongArray())
+                .equalTo("read", true)
+                .findAll()
+            val count = messages.size
+
+            // Keep every Realm message aligned with the unread state requested for the thread.
+            if (count > 0) {
+                realm.executeTransaction {
+                    messages.forEach { message -> message.read = false }
+                }
+            }
+            count
+        }
+
+        readStateChangesSubject.onNext(ids.toSet())
+        enqueueTelephonyReadStateUpdate(seen = null, read = false, threadIds = ids)
+        return updatedCount
+    }
 
     private fun syncProviderMessage(uri: Uri, sendAsGroup: Boolean): Message? {
         // if uri doesn't have valid type

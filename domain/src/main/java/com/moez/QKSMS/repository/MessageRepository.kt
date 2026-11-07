@@ -40,6 +40,9 @@ interface MessageRepository {
 
     val deduplicationProgress: Observable<DeduplicationProgress>
 
+    /** Emits thread IDs immediately after local read/unread flags are committed. */
+    val readStateChanges: Observable<Set<Long>>
+
     fun getMessages(threadId: Long, query: String = ""): RealmResults<Message>
 
     fun getMessagesSync(threadId: Long, query: String = ""): RealmResults<Message>

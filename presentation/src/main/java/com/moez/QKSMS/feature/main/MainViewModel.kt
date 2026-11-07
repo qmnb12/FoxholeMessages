@@ -125,6 +125,31 @@ class MainViewModel @Inject constructor(
         disposables += syncContacts
         disposables += syncMessages
 
+        // Conversation.unread is derived from lastMessage.read. Explicitly rebuild the visible
+        // conversation results after local read/unread commits so Inbox rows and category badges
+        // don't wait for an unrelated Conversation change or the next Activity resume.
+        disposables += messageRepo.readStateChanges
+            .observeOn(AndroidSchedulers.mainThread())
+            .subscribe { threadIds ->
+                newState {
+                    val refreshedPage = when (page) {
+                        is Inbox -> page.copy(
+                            data = conversationRepo.getConversations(prefs.unreadAtTop.get())
+                        )
+                        is Archived -> page.copy(
+                            data = conversationRepo.getConversations(prefs.unreadAtTop.get(), true)
+                        )
+                        else -> page
+                    }
+                    copy(
+                        page = refreshedPage,
+                        tabData = buildTabData(conversationRepo, prefs.unreadAtTop.get())
+                    )
+                }
+                refreshTabUnreadCounts()
+                Timber.d("Refreshed read state for conversations=$threadIds")
+            }
+
         // Show the syncing UI
         disposables += syncRepository.syncProgress
                 .sample(16, TimeUnit.MILLISECONDS)
