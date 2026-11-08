@@ -1,4 +1,4 @@
-/*
+/* 
  * Copyright (C) 2017 Moez Bhatti <moez.bhatti@gmail.com>
  *
  * This file is part of QKSMS.
@@ -22,33 +22,54 @@ import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 
 fun RecyclerView.Adapter<*>.autoScrollToStart(recyclerView: RecyclerView) {
+    fun scrollToLatestIfAlreadyAtEnd() {
+        val layoutManager = recyclerView.layoutManager as? LinearLayoutManager ?: return
+        if (!layoutManager.stackFromEnd || getItemCount() == 0) return
+
+        // The adapter count has already changed when RecyclerView dispatches this callback.
+        // Before layout runs, the old last visible row is therefore at most itemCount - 2.
+        // Only follow the new last message when the user was already at the end.
+        val lastVisible = layoutManager.findLastVisibleItemPosition()
+        val wasAtEnd = lastVisible == RecyclerView.NO_POSITION ||
+            lastVisible >= getItemCount() - 2
+
+        if (wasAtEnd) {
+            recyclerView.post {
+                val latestPosition = getItemCount() - 1
+                if (latestPosition >= 0) recyclerView.scrollToPosition(latestPosition)
+            }
+        }
+    }
+
     registerAdapterDataObserver(object : RecyclerView.AdapterDataObserver() {
         override fun onItemRangeInserted(positionStart: Int, itemCount: Int) {
             val layoutManager = recyclerView.layoutManager as? LinearLayoutManager ?: return
 
             if (layoutManager.stackFromEnd) {
-                if (positionStart > 0) {
-                    notifyItemChanged(positionStart - 1)
-                }
-
-                val lastPosition = layoutManager.findLastVisibleItemPosition()
-                if (positionStart >= getItemCount() - 1 && lastPosition == positionStart - 1) {
-                    recyclerView.scrollToPosition(positionStart)
-                }
+                if (positionStart > 0) notifyItemChanged(positionStart - 1)
+                scrollToLatestIfAlreadyAtEnd()
             } else {
                 val firstVisiblePosition = layoutManager.findFirstVisibleItemPosition()
                 if (firstVisiblePosition == 0) {
-                    recyclerView.scrollToPosition(positionStart)
+                    recyclerView.post { recyclerView.scrollToPosition(positionStart) }
                 }
             }
         }
 
         override fun onItemRangeChanged(positionStart: Int, itemCount: Int) {
             val layoutManager = recyclerView.layoutManager as? LinearLayoutManager ?: return
-
-            if (!layoutManager.stackFromEnd) {
+            if (layoutManager.stackFromEnd) {
+                scrollToLatestIfAlreadyAtEnd()
+            } else {
                 onItemRangeInserted(positionStart, itemCount)
             }
+        }
+
+        override fun onChanged() {
+            // Realm's adapter can dispatch a full refresh instead of a granular insert event.
+            // Handle that path too, otherwise newly-sent messages remain below the viewport
+            // until the conversation is reopened.
+            scrollToLatestIfAlreadyAtEnd()
         }
     })
 }
