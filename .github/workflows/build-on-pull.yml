@@ -30,16 +30,16 @@ jobs:
     - name: Validate and install release signing key for debug APK
       shell: bash
       env:
-        KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
-        KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-        KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-        KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        KEYSTORE_B64: ${{ secrets.SIGNING_KEY_BASE64 }}
+        KEYSTORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+        KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+        KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
       run: |
         set -euo pipefail
         missing=0
         for var in KEYSTORE_B64 KEYSTORE_PASSWORD KEY_ALIAS KEY_PASSWORD; do
           if [[ -z "${!var:-}" ]]; then
-            echo "::error title=Missing secret::${var} is not set. Configure all four ANDROID_* repository secrets."
+            echo "::error title=Missing secret::${var} is not set. Check the four SIGNING_* repository secrets."
             missing=1
           fi
         done
