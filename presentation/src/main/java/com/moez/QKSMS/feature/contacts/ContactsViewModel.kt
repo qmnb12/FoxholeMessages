@@ -68,11 +68,17 @@ class ContactsViewModel @Inject constructor(
             .observeOn(Schedulers.io())
             .map { hashmap ->
                 hashmap.map { (address, lookupKey) ->
-                    Recipient(address = address, contact = lookupKey?.let(contactsRepo::getUnmanagedContact))
+                    val savedLookupKey = lookupKey?.takeIf { it.isNotBlank() }
+                    Recipient(address = address, contact = savedLookupKey?.let(contactsRepo::getUnmanagedContact))
                 }
             }
 
     private var shouldOpenKeyboard: Boolean = true
+
+    private fun isContactSelected(contact: Contact, chips: List<Recipient>): Boolean {
+        val lookupKey = contact.lookupKey.takeIf { it.isNotBlank() } ?: return false
+        return chips.any { chip -> chip.contact?.lookupKey == lookupKey }
+    }
 
     override fun bindView(view: ContactsContract) {
         super.bindView(view)
@@ -103,11 +109,15 @@ class ContactsViewModel @Inject constructor(
                         composeItems += recents
                                 .filter { conversation ->
                                     conversation.recipients.any { recipient ->
+                                        val recipientLookupKey = recipient.contact?.lookupKey
+                                            ?.takeIf { it.isNotBlank() }
                                         selectedChips.none { chip ->
-                                            if (recipient.contact == null) {
-                                                chip.address == recipient.address
+                                            val chipLookupKey = chip.contact?.lookupKey
+                                                ?.takeIf { it.isNotBlank() }
+                                            if (recipientLookupKey != null) {
+                                                chipLookupKey == recipientLookupKey
                                             } else {
-                                                chip.contact?.lookupKey == recipient.contact?.lookupKey
+                                                phoneNumberUtils.compare(chip.address, recipient.address)
                                             }
                                         }
                                     }
@@ -115,13 +125,13 @@ class ContactsViewModel @Inject constructor(
                                 .map(ComposeItem::Recent)
 
                         composeItems += starredContacts
-                                .filter { contact -> selectedChips.none { it.contact?.lookupKey == contact.lookupKey } }
+                                .filter { contact -> !isContactSelected(contact, selectedChips) }
                                 .map(ComposeItem::Starred)
 
                         composeItems += contactGroups
                                 .filter { group ->
                                     group.contacts.any { contact ->
-                                        selectedChips.none { chip -> chip.contact?.lookupKey == contact.lookupKey }
+                                        !isContactSelected(contact, selectedChips)
                                     }
                                 }
                                 .map(ComposeItem::Group)
@@ -183,7 +193,7 @@ class ContactsViewModel @Inject constructor(
                     HashMap(composeItem.getContacts().associate { contact ->
                         if (contact.numbers.size == 1 || contact.getDefaultNumber() != null && !force) {
                             val address = contact.getDefaultNumber()?.address ?: contact.numbers[0]!!.address
-                            address to contact.lookupKey
+                            address to contact.lookupKey.takeIf { it.isNotBlank() }
                         } else {
                             runBlocking {
                                 newState { copy(selectedContact = contact) }
@@ -196,12 +206,13 @@ class ContactsViewModel @Inject constructor(
                                     return@runBlocking null
                                 }
 
-                                if (action == PhoneNumberAction.ALWAYS) {
-                                    val params = SetDefaultPhoneNumber.Params(contact.lookupKey, number.id)
+                                val savedLookupKey = contact.lookupKey.takeIf { it.isNotBlank() }
+                                if (action == PhoneNumberAction.ALWAYS && savedLookupKey != null) {
+                                    val params = SetDefaultPhoneNumber.Params(savedLookupKey, number.id)
                                     setDefaultPhoneNumber.execute(params)
                                 }
 
-                                number.address to contact.lookupKey
+                                number.address to savedLookupKey
                             } ?: return@map hashMapOf<String, String?>()
                         }
                     })

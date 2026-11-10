@@ -34,26 +34,31 @@ class PhoneNumberUtils @Inject constructor(context: Context) {
     private val phoneNumberUtil = PhoneNumberUtil.createInstance(context)
 
     /**
-     * Android's implementation is too loose and causes false positives
-     * libphonenumber is stricter but too slow
+     * Compares two recipient addresses without treating a shared suffix as identity.
      *
-     * This method will run successfully stricter checks without compromising much speed
+     * SHORT_NSN_MATCH is intentionally rejected: it means one number is only a shortened
+     * national number of the other, which is not strong enough to attach a saved contact or
+     * reuse an SMS thread. Exact normalized strings and full NSN matches (for example, a
+     * national number versus the same number with its country calling code) are safe.
      */
     fun compare(first: String, second: String): Boolean {
         val normalizedFirst = normalizeNumber(first)
         val normalizedSecond = normalizeNumber(second)
-        if (normalizedFirst.equals(normalizedSecond, true)) {
+
+        if (normalizedFirst.isBlank() || normalizedSecond.isBlank()) {
+            return false
+        }
+
+        if (normalizedFirst.equals(normalizedSecond, ignoreCase = true)) {
             return true
         }
 
-        if (PhoneNumberUtils.compare(first, second)) {
-            val matchType = phoneNumberUtil.isNumberMatch(normalizedFirst, normalizedSecond)
-            if (matchType >= PhoneNumberUtil.MatchType.SHORT_NSN_MATCH) {
-                return true
-            }
-        }
+        val matchType = tryOrNull(false) {
+            phoneNumberUtil.isNumberMatch(normalizedFirst, normalizedSecond)
+        } ?: return false
 
-        return false
+        return matchType == PhoneNumberUtil.MatchType.EXACT_MATCH ||
+            matchType == PhoneNumberUtil.MatchType.NSN_MATCH
     }
 
     fun isPossibleNumber(number: CharSequence): Boolean {
@@ -104,6 +109,10 @@ class PhoneNumberUtils @Inject constructor(context: Context) {
             val exactMatches = LinkedHashMap<String, LinkedHashMap<String, Contact>>()
 
             contacts.forEach { contact ->
+                // Empty lookup keys belong to synthetic number-only recipients, not saved contacts.
+                // Never use them as a contact identity or collapse different contacts under "".
+                if (contact.lookupKey.isBlank()) return@forEach
+
                 contact.numbers.forEach { number ->
                     val normalized = normalizeNumber(number.address).lowercase(Locale.ROOT)
                     if (normalized.isNotBlank()) {

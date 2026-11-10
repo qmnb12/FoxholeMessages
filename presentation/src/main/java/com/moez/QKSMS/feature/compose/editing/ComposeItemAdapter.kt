@@ -182,14 +182,22 @@ class ComposeItemAdapter @Inject constructor(
     }
 
     private fun createRecipient(contact: Contact): Recipient {
-        return recipients[contact.lookupKey] ?: Recipient(
+        // A typed number is represented by a synthetic Contact with an empty lookup key.
+        // Do not let it resolve through the saved-recipient index (where "" could collide).
+        val lookupKey = contact.lookupKey.takeIf { it.isNotBlank() }
+        return lookupKey?.let(recipients::get) ?: Recipient(
             address = contact.numbers.firstOrNull()?.address ?: "",
-            contact = contact)
+            contact = contact.takeIf { lookupKey != null }
+        )
     }
 
     override fun onAttachedToRecyclerView(recyclerView: RecyclerView) {
         disposables += conversationRepo.getUnmanagedRecipients()
-                .map { recipients -> recipients.associateByNotNull { recipient -> recipient.contact?.lookupKey } }
+                .map { recipients ->
+                    recipients.associateByNotNull { recipient ->
+                        recipient.contact?.lookupKey?.takeIf { it.isNotBlank() }
+                    }
+                }
                 .subscribe { recipients -> this@ComposeItemAdapter.recipients = recipients }
     }
 

@@ -325,19 +325,40 @@ class ConversationRepositoryImpl @Inject constructor(
         createConversationFromCp(threadId, sendAsGroup)
 
 
-    override fun getConversation(recipients: Collection<String>): Conversation? =
-        Realm.getDefaultInstance().use { realm ->
+    override fun getConversation(recipients: Collection<String>): Conversation? {
+        // Empty or duplicate recipient identities must never resolve to an unrelated thread.
+        if (recipients.isEmpty() || recipients.any { it.isBlank() }) return null
+
+        return Realm.getDefaultInstance().use { realm ->
             realm.refresh()
+            val requestedAddresses = recipients.toList()
+
             realm.where(Conversation::class.java)
                 .findAll()
-                .filter { conversation -> conversation.recipients.size == recipients.size }
-                .find { conversation ->
-                    conversation.recipients.map { it.address }.all { recipientAddress ->
-                        recipients.any { phoneNumberUtils.compare(it, recipientAddress) }
+                .firstOrNull { conversation ->
+                    if (conversation.recipients.size != requestedAddresses.size) {
+                        false
+                    } else {
+                        // Match one-to-one. The previous "any" check could match multiple stored
+                        // recipients against the same requested address in a group conversation.
+                        val unmatched = requestedAddresses.toMutableList()
+                        val allMatched = conversation.recipients.all { storedRecipient ->
+                            val matchIndex = unmatched.indexOfFirst { requestedAddress ->
+                                phoneNumberUtils.compare(requestedAddress, storedRecipient.address)
+                            }
+                            if (matchIndex < 0) {
+                                false
+                            } else {
+                                unmatched.removeAt(matchIndex)
+                                true
+                            }
+                        }
+                        allMatched && unmatched.isEmpty()
                     }
                 }
                 ?.let { realm.copyFromRealm(it) }
         }
+    }
 
     override fun createConversation(addresses: Collection<String>, sendAsGroup: Boolean) =
         TelephonyCompat.getOrCreateThreadId(context, addresses.toSet())

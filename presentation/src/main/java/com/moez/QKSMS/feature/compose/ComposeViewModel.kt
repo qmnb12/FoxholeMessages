@@ -354,14 +354,22 @@ class ComposeViewModel @Inject constructor(
                 }
                 .filter { hashmap -> hashmap.isNotEmpty() }
                 .map { hashmap ->
-                    hashmap.map { (address, lookupKey) ->
-                        conversationRepo.getRecipients()
-                                .asSequence()
-                                .filter { recipient -> recipient.contact?.lookupKey == lookupKey }
-                                .firstOrNull { recipient -> phoneNumberUtils.compare(recipient.address, address) }
-                                ?: Recipient(
-                                        address = address,
-                                        contact = lookupKey?.let(contactRepo::getUnmanagedContact))
+                    val existingRecipients = conversationRepo.getRecipients()
+                    hashmap.map { (address, rawLookupKey) ->
+                        // Number-only and recent-number rows use a synthetic Contact whose
+                        // lookupKey is "". Treat that as no contact identity, never as a key.
+                        val lookupKey = rawLookupKey?.takeIf { it.isNotBlank() }
+                        val existingRecipient = lookupKey?.let { savedLookupKey ->
+                            existingRecipients.firstOrNull { recipient ->
+                                recipient.contact?.lookupKey == savedLookupKey &&
+                                    phoneNumberUtils.compare(recipient.address, address)
+                            }
+                        }
+
+                        existingRecipient ?: Recipient(
+                            address = address,
+                            contact = lookupKey?.let(contactRepo::getUnmanagedContact)
+                        )
                     }
                 }
                 .autoDisposable(view.scope())
