@@ -79,7 +79,8 @@ android {
             versionNameSuffix "-debug"
             resValue("string", "app_name", "Foxhole Messages-Debug")
             resValue("string", "application_id", defaultConfig.applicationId)
-            signingConfig signingConfigs.debug
+            // Keep debug APK updates installable over releases signed with the same private key.
+            signingConfig signingConfigs.release
         }
         fdroid {
             minifyEnabled true
