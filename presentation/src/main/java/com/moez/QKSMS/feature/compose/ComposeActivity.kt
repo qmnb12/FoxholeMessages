@@ -786,11 +786,18 @@ class ComposeActivity : QkThemedActivity(), ComposeView {
     }
 
     override fun showDeleteDialog(messages: List<Long>) {
-        val count = messages.size
+        // selectionChanges exposes a mutable backing list. Capture a stable snapshot so
+        // clearing/changing selection while this dialog is open cannot erase the confirmed IDs.
+        val confirmedMessageIds = messages.distinct()
+        if (confirmedMessageIds.isEmpty()) return
+
+        val count = confirmedMessageIds.size
         AlertDialog.Builder(this)
             .setTitle(R.string.dialog_delete_title)
             .setMessage(resources.getQuantityString(R.plurals.dialog_delete_chat, count, count))
-            .setPositiveButton(R.string.button_delete) { _, _ -> confirmDeleteIntent.onNext(messages) }
+            .setPositiveButton(R.string.button_delete) { _, _ ->
+                confirmDeleteIntent.onNext(confirmedMessageIds)
+            }
             .setNegativeButton(R.string.button_cancel, null)
             .show()
     }
