@@ -613,6 +613,14 @@ class ComposeActivity : QkThemedActivity(), ComposeView {
 
     override fun clearSelection() = messageAdapter.clearSelection()
 
+    override fun hidePendingDeleteMessages(messageIds: List<Long>) {
+        messageAdapter.hidePendingDelete(messageIds)
+    }
+
+    override fun restorePendingDeleteMessages(messageIds: List<Long>) {
+        messageAdapter.restorePendingDelete(messageIds)
+    }
+
     override fun toggleSelectAll() {
         messageAdapter.toggleSelectAll()
     }

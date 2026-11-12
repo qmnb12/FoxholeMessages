@@ -94,6 +94,8 @@ interface ComposeView : QkView<ComposeState> {
     val recordAudioChronometer: Subject<Boolean>
 
     fun clearSelection()
+    fun hidePendingDeleteMessages(messageIds: List<Long>)
+    fun restorePendingDeleteMessages(messageIds: List<Long>)
     fun toggleSelectAll()
     fun expandMessages(messageIds: List<Long>, expand: Boolean)
     fun showDetails(details: String)

@@ -80,6 +80,7 @@ import io.reactivex.android.schedulers.AndroidSchedulers
 import io.reactivex.disposables.Disposable
 import io.reactivex.subjects.PublishSubject
 import io.reactivex.subjects.Subject
+import io.realm.RealmChangeListener
 import io.realm.RealmResults
 import timber.log.Timber
 import java.util.*
@@ -129,6 +130,7 @@ class MessagesAdapter @Inject constructor(
             field = value
             contactCache.clear()
 
+            observePendingDeleteResults(value?.second)
             updateData(value?.second)
         }
 
@@ -145,6 +147,53 @@ class MessagesAdapter @Inject constructor(
     var theme: Colors.Theme = colors.theme()
 
     private val audioState = AudioState()
+
+    // Optimistically hidden message IDs keep the conversation responsive while the
+    // background Realm transaction moves selected messages to Trash.
+    private val pendingDeleteIds = LinkedHashSet<Long>()
+    private var pendingDeleteObservedResults: RealmResults<Message>? = null
+
+    private val pendingDeleteChangeListener = RealmChangeListener<RealmResults<Message>> { results ->
+        if (pendingDeleteIds.isNotEmpty()) {
+            val currentIds = HashSet<Long>(results.size)
+            results.forEach { message -> currentIds.add(message.id) }
+
+            if (pendingDeleteIds.removeAll { id -> id !in currentIds }) {
+                notifyDataSetChanged()
+            }
+
+            if (pendingDeleteIds.isEmpty()) {
+                observePendingDeleteResults(null)
+            }
+        }
+    }
+
+    private fun observePendingDeleteResults(results: RealmResults<Message>?) {
+        if (pendingDeleteObservedResults === results) return
+
+        pendingDeleteObservedResults?.removeChangeListener(pendingDeleteChangeListener)
+        pendingDeleteObservedResults = results
+
+        if (pendingDeleteIds.isNotEmpty()) {
+            results?.addChangeListener(pendingDeleteChangeListener)
+        } else {
+            pendingDeleteObservedResults = null
+        }
+    }
+
+    fun hidePendingDelete(messageIds: Collection<Long>) {
+        if (pendingDeleteIds.addAll(messageIds)) {
+            observePendingDeleteResults(data?.second)
+            notifyDataSetChanged()
+        }
+    }
+
+    fun restorePendingDelete(messageIds: Collection<Long>) {
+        if (pendingDeleteIds.removeAll(messageIds.toSet())) {
+            if (pendingDeleteIds.isEmpty()) observePendingDeleteResults(null)
+            notifyDataSetChanged()
+        }
+    }
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): QkViewHolder {
         // Use the parent's context to inflate the layout, otherwise link clicks will crash the app
@@ -202,6 +251,9 @@ class MessagesAdapter @Inject constructor(
 
     override fun onBindViewHolder(holder: QkViewHolder, position: Int) {
         val message = getItem(position) ?: return
+        holder.itemView.visibility =
+            if (message.id in pendingDeleteIds) View.GONE else View.VISIBLE
+
         val previous = if (position == 0) null else getItem(position - 1)
         val next = if (position == itemCount - 1) null else getItem(position + 1)
 

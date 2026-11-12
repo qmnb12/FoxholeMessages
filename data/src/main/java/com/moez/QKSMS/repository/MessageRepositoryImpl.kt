@@ -1206,8 +1206,9 @@ open class MessageRepositoryImpl @Inject constructor(
 
     override fun trashMessages(messageIds: Collection<Long>) =
         Realm.getDefaultInstance().use { realm ->
-            realm.refresh()
-
+            // A newly opened Realm already sees the latest committed data. Avoid a synchronous
+            // refresh here: it can wait behind unrelated provider-sync writes and delay a simple
+            // local soft-delete. This path only updates Realm; it does not touch the SMS provider.
             val messages = realm.where(Message::class.java)
                 .anyOf("id", messageIds.toLongArray())
                 .findAll()

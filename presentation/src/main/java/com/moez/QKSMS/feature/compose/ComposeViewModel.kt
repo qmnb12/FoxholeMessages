@@ -1432,13 +1432,25 @@ class ComposeViewModel @Inject constructor(
                 .autoDisposable(view.scope())
                 .subscribe()
 
-        // Delete the message
+        // Hide deleted bubbles immediately. The Realm query removes them permanently from the
+        // active conversation once the background soft-delete transaction commits. If the
+        // transaction fails, restore their rows so the UI never lies about persisted state.
         view.confirmDeleteIntent
-                .withLatestFrom(view.messagesSelectedIntent, conversation) { _, messages, conversation ->
-                    deleteMessages.execute(DeleteMessages.Params(messages.toList(), conversation.id))
-                }
-                .autoDisposable(view.scope())
-                .subscribe { view.clearSelection() }
+            .withLatestFrom(view.messagesSelectedIntent, conversation) { _, messageIds, conversation ->
+                messageIds.toList() to conversation.id
+            }
+            .autoDisposable(view.scope())
+            .subscribe { (messageIds, threadId) ->
+                view.hidePendingDeleteMessages(messageIds)
+                view.clearSelection()
+                deleteMessages.execute(
+                    DeleteMessages.Params(messageIds, threadId),
+                    onError = { error ->
+                        view.restorePendingDeleteMessages(messageIds)
+                        Timber.e(error, "Unable to move selected messages to Trash")
+                    }
+                )
+            }
 
         // clear the current message schedule, text and attachments
         view.clearCurrentMessageIntent
