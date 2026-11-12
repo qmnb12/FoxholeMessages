@@ -1436,9 +1436,13 @@ class ComposeViewModel @Inject constructor(
         // active conversation once the background soft-delete transaction commits. If the
         // transaction fails, restore their rows so the UI never lies about persisted state.
         view.confirmDeleteIntent
-            .withLatestFrom(view.messagesSelectedIntent, conversation) { _, messageIds, conversation ->
-                messageIds.toList() to conversation.id
+            // The confirmation dialog already carries the exact IDs the user approved.
+            // Do not re-read the adapter's mutable selection here: it may have changed
+            // or been cleared while the dialog was open.
+            .withLatestFrom(conversation) { confirmedMessageIds, conversation ->
+                confirmedMessageIds.distinct() to conversation.id
             }
+            .filter { (messageIds, _) -> messageIds.isNotEmpty() }
             .autoDisposable(view.scope())
             .subscribe { (messageIds, threadId) ->
                 view.hidePendingDeleteMessages(messageIds)
